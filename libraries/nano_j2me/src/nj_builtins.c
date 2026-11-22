@@ -1,0 +1,166 @@
+/*
+ * nano_j2me - nj_builtins.c
+ *
+ * Materialises every C-implemented class (the "class library") and runs the
+ * late static initialisation.
+ *
+ * The aggregation table below is `const`, so it is placed in .rodata/flash and
+ * costs no RAM.  All mutable state produced here hangs off the nj_vm instance.
+ */
+#include "nj_internal.h"
+
+const nj_builtin_source nj_builtin_sources[] = {
+    { nj_lib_object_classes, &nj_lib_object_class_count },
+    { nj_lib_string_classes, &nj_lib_string_class_count },
+    { nj_lib_system_classes, &nj_lib_system_class_count },
+    { nj_lib_math_classes,   &nj_lib_math_class_count   },
+    { nj_lib_thread_classes, &nj_lib_thread_class_count },
+    { nj_lib_boxing_classes, &nj_lib_boxing_class_count },
+    { nj_lib_util_classes,   &nj_lib_util_class_count   },
+    { nj_lib_io_classes,     &nj_lib_io_class_count     },
+    { nj_lib_lcdui_classes,  &nj_lib_lcdui_class_count  },
+    { nj_lib_game_classes,   &nj_lib_game_class_count   },
+    { nj_lib_rms_classes,    &nj_lib_rms_class_count    },
+    { nj_lib_midlet_classes, &nj_lib_midlet_class_count },
+    { nj_lib_media_classes,  &nj_lib_media_class_count  },
+    { nj_lib_content_classes, &nj_lib_content_class_count },
+    { nj_lib_sax_classes,     &nj_lib_sax_class_count     },
+    { nj_lib_nokia_classes,  &nj_lib_nokia_class_count  },
+    { nj_lib_fc_classes,     &nj_lib_fc_class_count     },
+    { nj_lib_http_classes,   &nj_lib_http_class_count   },
+    { nj_lib_pim_classes,    &nj_lib_pim_class_count    },
+    { nj_lib_samsung_classes, &nj_lib_samsung_class_count },
+    { nj_lib_siemens_classes, &nj_lib_siemens_class_count },
+    { nj_lib_sprint_classes, &nj_lib_sprint_class_count },
+    { nj_lib_immersion_classes, &nj_lib_immersion_class_count },
+    { nj_lib_pki_classes, &nj_lib_pki_class_count },
+    { nj_lib_socket_classes, &nj_lib_socket_class_count }
+    , { nj_lib_datagram_classes, &nj_lib_datagram_class_count }
+    , { nj_lib_sensor_classes, &nj_lib_sensor_class_count }
+    , { nj_lib_bt_classes, &nj_lib_bt_class_count }
+    , { nj_lib_wireless_classes, &nj_lib_wireless_class_count }
+    , { nj_lib_m3g_classes, &nj_lib_m3g_class_count }
+    , { nj_lib_mascot_classes, &nj_lib_mascot_class_count }
+    , { nj_lib_location_classes, &nj_lib_location_class_count }
+};
+const int nj_builtin_source_count =
+    (int)(sizeof(nj_builtin_sources) / sizeof(nj_builtin_sources[0]));
+
+nj_status nj_builtins_register_all(nj_vm *vm)
+{
+    int s;
+    int pass;
+
+    if (!vm) {
+        return NJ_ERR;
+    }
+
+    /* Pass 1: create every class record so that cross-references resolve. */
+    for (s = 0; s < nj_builtin_source_count; s++) {
+        const nj_builtin_class *cs = nj_builtin_sources[s].classes;
+        int n = *nj_builtin_sources[s].count;
+        int i;
+        for (i = 0; i < n; i++) {
+            nj_class *c = nj_class_create_builtin(vm, &cs[i]);
+            if (!c) {
+                nj_logf(vm, 0, "cannot create builtin class %s", cs[i].name);
+                continue;
+            }
+            if (vm->nbuiltins >= vm->builtin_cap) {
+                nj_u2 cap = vm->builtin_cap ? (nj_u2)(vm->builtin_cap * 2u) : 64u;
+                nj_class **nb = (nj_class **)nj_host_alloc(
+                    vm, (nj_size)cap * sizeof(nj_class *));
+                if (!nb) {
+                    /* Fatal, and said so here rather than left for whatever
+                     * looks up a builtin class next.  A partially registered
+                     * table does not fail where it broke. */
+                    nj_logf(vm, 0, "out of host memory registering builtin "
+                                   "classes (%d so far) - the pool is too "
+                                   "small for the VM itself, not just the Java "
+                                   "heap", (int)vm->nbuiltins);
+                    return NJ_ERR_NOMEM;
+                }
+                if (vm->builtins) {
+                    nj_u4 k;
+                    for (k = 0u; k < vm->nbuiltins; k++) {
+                        nb[k] = vm->builtins[k];
+                    }
+                    nj_host_free(vm, vm->builtins);
+                }
+                vm->builtins = nb;
+                vm->builtin_cap = cap;
+            }
+            vm->builtins[vm->nbuiltins++] = c;
+        }
+    }
+
+    /*
+     * Pass 2: link repeatedly until the graph settles.  Linking is idempotent
+     * and returns early once a class is linked, so the extra passes simply
+     * pick up classes whose superclass had not been created yet in pass 1.
+     */
+    for (pass = 0; pass < 4; pass++) {
+        nj_u4 i;
+        int progress = 0;
+        for (i = 0u; i < vm->nbuiltins; i++) {
+            nj_class *c = vm->builtins[i];
+            if (c && c->state < NJ_CLASS_LINKED) {
+                if (nj_class_link(vm, c) == NJ_OK) {
+                    progress = 1;
+                }
+            }
+        }
+        if (!progress) {
+            break;
+        }
+    }
+
+    /* Object must always exist: the interpreter and GC assume it. */
+    if (!vm->cls_object) {
+        nj_logf(vm, 0, "builtin class library is missing java/lang/Object");
+        return NJ_ERR;
+    }
+    /* Wrapper TYPE statics need the primitive Class mirrors, which exist only
+     * after the whole builtin table is linked. */
+    if (nj_boxing_init(vm) != NJ_OK) {
+        return NJ_ERR;
+    }
+    return nj_lib_sax_init(vm);
+}
+
+/* Developer tooling: dump the static builtin tables.  No VM is required, so
+ * this works before a JAR is opened. */
+int nj_dump_builtin_api(const char *path)
+{
+    FILE *f = path ? fopen(path, "w") : stdout;
+    int s;
+    if (!f) {
+        return 0;
+    }
+    for (s = 0; s < nj_builtin_source_count; s++) {
+        const nj_builtin_class *cs = nj_builtin_sources[s].classes;
+        int n = *nj_builtin_sources[s].count;
+        int i;
+        for (i = 0; i < n; i++) {
+            const nj_builtin_class *bc = &cs[i];
+            nj_u2 j;
+            fprintf(f, "%s\t%s\tclass\t\t\n", bc->name,
+                    bc->super ? bc->super : "");
+            for (j = 0; j < bc->nmethods; j++) {
+                fprintf(f, "%s\t%s\tmethod\t%s\t%s\n", bc->name,
+                        bc->super ? bc->super : "",
+                        bc->methods[j].name, bc->methods[j].desc);
+            }
+            for (j = 0; j < bc->nfields; j++) {
+                fprintf(f, "%s\t%s\tfield\t%s\t%s\t%u\n", bc->name,
+                        bc->super ? bc->super : "",
+                        bc->fields[j].name, bc->fields[j].desc,
+                        (unsigned)bc->fields[j].flags);
+            }
+        }
+    }
+    if (path) {
+        fclose(f);
+    }
+    return 1;
+}

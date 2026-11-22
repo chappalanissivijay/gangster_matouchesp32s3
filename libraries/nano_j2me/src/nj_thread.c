@@ -1,0 +1,1351 @@
+/*
+ * nano_j2me - nj_thread.c
+ *
+ * Cooperative ("green") threads, Java frame allocation and the scheduler.
+ *
+ * WHY GREEN THREADS
+ * A J2ME MIDlet uses java.lang.Thread freely, but the runtime must also run on
+ * a microcontroller with no MMU and, often, no preemptive scheduler of its
+ * own.  Mapping Java threads onto OS threads would force every OS thread to
+ * share the GC root set, need real mutexes around every object, and make
+ * teardown non-deterministic.  Instead each Java thread is a plain C structure
+ * with its own Java stack; the interpreter switches between them at
+ * instruction-count boundaries (NJ_SCHED_QUANTUM).  That gives:
+ *
+ *   - a single-threaded GC with a trivially enumerable root set,
+ *   - byte-identical behaviour on Linux, Android and ESP32-S3,
+ *   - deterministic, complete teardown.
+ *
+ * BLOCKING
+ * A native that must block (Thread.sleep, Object.wait, Player.realize) sets
+ * the thread state and returns NJ_ERR_TIMEOUT.  The interpreter pops the
+ * native frame, delivers the return value and suspends the thread; the
+ * scheduler skips it until its deadline or a notify() makes it runnable
+ * again.  No C stack is ever suspended, so this works on any port.
+ */
+#include "nj_internal.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+#if NJ_USE_LIBC
+#  include <string.h>
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Time                                                                */
+/* ------------------------------------------------------------------ */
+static int clock_epoch_ms(const nj_datetime *dt, nj_s8 *out)
+{
+    static const nj_u2 month_days[12] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+    };
+    static const nj_u1 month_length[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    nj_s8 y, days;
+    int leap, max_day;
+
+    /* Check every field used below before indexing or doing arithmetic. */
+    if (dt->year < 1 || dt->year > 9999 ||
+        dt->month < 0 || dt->month > 11 ||
+        dt->hour < 0 || dt->hour > 23 ||
+        dt->minute < 0 || dt->minute > 59 ||
+        dt->second < 0 || dt->second > 59 ||
+        dt->millis < 0 || dt->millis > 999 ||
+        dt->tz_offset <= -1440 || dt->tz_offset >= 1440) {
+        return 0;
+    }
+    leap = dt->year % 4 == 0 &&
+           (dt->year % 100 != 0 || dt->year % 400 == 0);
+    max_day = month_length[dt->month] + (dt->month == 1 && leap);
+    if (dt->day < 1 || dt->day > max_day) {
+        return 0;
+    }
+    y = (nj_s8)dt->year - 1;
+    /* Gregorian days before this year, relative to 1970-01-01. */
+    days = y * 365 + y / 4 - y / 100 + y / 400 - 719162;
+    days += month_days[dt->month] + (dt->month > 1 && leap) + dt->day - 1;
+    *out = days * 86400000 + (nj_s8)dt->hour * 3600000
+         + (nj_s8)dt->minute * 60000 + (nj_s8)dt->second * 1000
+         + dt->millis - (nj_s8)dt->tz_offset * 60000;
+    return 1;
+}
+
+nj_s8 nj_now_ms(nj_vm *vm)
+{
+    nj_u4 ms;
+
+    if (vm && vm->port && vm->port->millis) {
+        ms = vm->port->millis(vm->port->ud);
+    } else {
+#if NJ_USE_LIBC
+        ms = 0u;
+#else
+        ms = 0u;
+#endif
+    }
+    if (!vm) {
+        return (nj_s8)ms;
+    }
+    /* Fold the 32-bit port clock into the VM's monotonic epoch so that the
+     * value keeps increasing across a wrap. */
+    {
+        nj_u4 last = (nj_u4)(vm->scheduler_ticks & 0xFFFFFFFFu);
+        if (ms < last) {
+            vm->scheduler_ticks += 0x100000000ull;
+        }
+        vm->scheduler_ticks = (vm->scheduler_ticks & ~0xFFFFFFFFull) | ms;
+    }
+    {
+        /* A zero here means "not set yet" - a VM that has never been told a
+         * speed runs at real time, and it must not depend on an initialiser
+         * somewhere else having run. */
+        int percent = (vm->speed_percent > 0) ? vm->speed_percent : 100;
+        nj_s8 real = (nj_s8)vm->scheduler_ticks;
+        nj_s8 virt = vm->speed_virtual
+                   + (real - vm->speed_real) * percent / 100;
+
+        if (percent == 100) {
+            /* Real time: keep the origin on the clock so the arithmetic above
+             * cannot drift over a long session.  It is rebased AFTER the value
+             * the MIDlet gets is computed - rebasing first is what made the
+             * clock jump backwards when the player turned the multiplier back
+             * off, and every parked deadline would have fired at once. */
+            vm->speed_virtual = virt;
+            vm->speed_real = real;
+        }
+        return virt;
+    }
+}
+
+void nj_clock_init(nj_vm *vm)
+{
+    nj_datetime dt = {0};
+    nj_s8 epoch;
+
+    if (vm && vm->port && vm->port->now &&
+        vm->port->now(vm->port->ud, &dt) && clock_epoch_ms(&dt, &epoch)) {
+        /* Sample/fold the raw counter, then anchor once. Later reads use only
+         * millis, so host wall-clock adjustments cannot change deadlines. */
+        (void)nj_now_ms(vm);
+        vm->speed_real = vm->scheduler_ticks;
+        vm->speed_virtual = epoch;
+    }
+}
+
+void nj_vm_set_speed(nj_vm *vm, int percent)
+{
+    nj_s8 now;
+
+    if (!vm) {
+        return;
+    }
+    if (percent < 10) {
+        percent = 10;
+    }
+    if (percent > 800) {
+        percent = 800;
+    }
+    /* Read the clock through the OLD scale first: that instant is where the
+     * new one starts, so a MIDlet never sees its clock jump. */
+    now = nj_now_ms(vm);
+    vm->speed_virtual = now;
+    vm->speed_real = (nj_s8)vm->scheduler_ticks;
+    vm->speed_percent = percent;
+}
+
+/* Deterministic replay/netplay: seed default-constructed Random instances from
+ * a per-VM counter so identical input sequences produce identical games.  The
+ * counter is reset on enable; saved Random objects keep their Java state, so
+ * rolling back a state restores their sequence too. */
+void nj_vm_set_deterministic(nj_vm *vm, int enabled)
+{
+    if (!vm) return;
+    vm->deterministic = enabled != 0;
+    vm->deterministic_seed = 0x4E4F4A3200000001ull;
+}
+
+int nj_vm_speed(const nj_vm *vm)
+{
+    return vm ? vm->speed_percent : 100;
+}
+
+void nj_vm_set_frame_cap(nj_vm *vm, int cap)
+{
+    if (!vm) {
+        return;
+    }
+    if (cap < -1) {
+        cap = -1;
+    }
+    if (cap > 1000) {
+        cap = 1000;
+    }
+    vm->frame_cap = cap;
+}
+
+int nj_vm_frame_cap(const nj_vm *vm)
+{
+    if (!vm) {
+        return 0;
+    }
+    if (vm->frame_cap >= 0) {
+        return vm->frame_cap;
+    }
+    return vm->port ? vm->port->fps_cap : 0;
+}
+
+void nj_vm_set_verbose(nj_vm *vm, int level)
+{
+    if (!vm) {
+        return;
+    }
+    if (level < 0) {
+        level = 0;
+    }
+    if (level > 3) {
+        level = 3;
+    }
+    vm->verbose = (nj_u2)level;
+}
+
+int nj_vm_verbose(const nj_vm *vm)
+{
+    return vm ? (int)vm->verbose : 0;
+}
+
+static void port_idle(nj_vm *vm)
+{
+    if (vm && vm->port && vm->port->idle) {
+        vm->port->idle(vm->port->ud);
+    }
+}
+
+static void port_sleep(nj_vm *vm, nj_u4 ms)
+{
+    if (vm && vm->port && vm->port->sleep_ms) {
+        vm->port->sleep_ms(vm->port->ud, ms);
+    } else {
+        port_idle(vm);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Thread lifecycle                                                    */
+/* ------------------------------------------------------------------ */
+nj_thread *nj_thread_create(nj_vm *vm, nj_ref thread_obj, int is_main)
+{
+    nj_thread *t;
+    nj_value *stack;
+
+    if (!vm || vm->nthreads >= (nj_u2)NJ_MAX_THREADS) {
+        return NULL;
+    }
+    t = (nj_thread *)nj_host_alloc(vm, sizeof(nj_thread));
+    if (!t) {
+        return NULL;
+    }
+    stack = (nj_value *)nj_host_alloc(
+        vm, (nj_size)NJ_MAX_STACK_SLOTS * sizeof(nj_value));
+    if (!stack) {
+        nj_host_free(vm, t);
+        return NULL;
+    }
+    t->stack_mem = stack;
+    t->stack_end = stack + NJ_MAX_STACK_SLOTS;
+    t->top = stack;
+    t->nframes = 0;
+    t->obj = thread_obj;
+    t->state = is_main ? NJ_THREAD_RUNNING : NJ_THREAD_NEW;
+    t->is_main = (nj_u1)(is_main ? 1 : 0);
+    t->priority = 5;
+    t->id = ++vm->next_thread_id;
+    t->wake_at_ms = 0;
+    t->nmonitors = 0u;
+    t->wait_kind = NJ_WAIT_NONE;
+    t->wait_ready = 0u;
+    t->wait_depth = 0u;
+    t->repaint_paced = 0u;
+    {
+        unsigned mi;
+        for (mi = 0u; mi < (unsigned)NJ_MAX_MONITORS; mi++) {
+            t->monitors[mi] = NULL;
+            t->mon_depth[mi] = 0u;
+        }
+    }
+    vm->threads[vm->nthreads++] = t;
+    return t;
+}
+
+/*
+ * Release the slots of threads whose run() has already returned.  A finished
+ * thread used to keep its slot until the VM shut down, so a title that starts
+ * a fresh thread per level eventually hit NJ_MAX_THREADS and died with a
+ * spurious OutOfMemoryError ("too many threads").  The Java handle is the
+ * numeric id kept in the object's nativeId field, not a pointer, so a dead
+ * thread can be freed once its Java frames and nested C calls have unwound.
+ * A recursive scheduler pass can observe DEAD while an outer native still
+ * owns the thread; vm->cur alone does not identify every such C stack.
+ */
+static void nj_thread_reap(nj_vm *vm)
+{
+    nj_u2 i;
+
+    for (i = vm->nthreads; i > 0u; i--) {
+        nj_thread *t = vm->threads[i - 1u];
+
+        if (t && t->state == NJ_THREAD_DEAD && t != vm->cur &&
+            !t->is_main && !t->in_c_call && t->nframes == 0u) {
+            nj_thread_destroy(vm, t);
+        }
+    }
+}
+
+void nj_thread_destroy(nj_vm *vm, nj_thread *t)
+{
+    nj_u2 i;
+
+    if (!vm || !t) {
+        return;
+    }
+    for (i = 0u; i < vm->nthreads; i++) {
+        if (vm->threads[i] == t) {
+            vm->threads[i] = vm->threads[vm->nthreads - 1u];
+            vm->nthreads--;
+            break;
+        }
+    }
+    if (vm->cur == t) {
+        vm->cur = NULL;
+    }
+    if (t->stack_mem) {
+        nj_host_free(vm, t->stack_mem);
+    }
+    nj_host_free(vm, t);
+}
+
+nj_thread *nj_thread_self(nj_vm *vm)
+{
+    return vm ? vm->cur : NULL;
+}
+
+/*
+ * The MIDlet's own thread: the one nj_vm_create makes, the one the frame loop
+ * drives, and the thread every call the host makes from C belongs to.  NULL
+ * only before the VM has a thread at all.
+ */
+nj_thread *nj_thread_main(nj_vm *vm)
+{
+    nj_u2 i;
+
+    if (!vm) {
+        return NULL;
+    }
+    for (i = 0u; i < vm->nthreads; i++) {
+        if (vm->threads[i] && vm->threads[i]->is_main) {
+            return vm->threads[i];
+        }
+    }
+    return NULL;
+}
+
+void nj_yield(nj_vm *vm)
+{
+    if (vm && vm->cur) {
+        vm->cur->wakeup_seq |= 0u;   /* no-op, keeps the intent readable */
+        vm->cur->state = NJ_THREAD_RUNNING;
+    }
+    /*
+     * No clock here.  This used to do `vm->scheduler_ticks++`, and the same
+     * line sits at the end of scheduler_step: together they added a
+     * millisecond to the MIDlet's clock on every scheduler pass, on top of
+     * the port's own millisecond clock that nj_now_ms folds into the same
+     * counter.  A busy title then saw its clock run many times faster than
+     * the wall clock - 合金弹头2013BT版_678 gained roughly 30 ms of MIDlet
+     * time per 5 ms frame - so the runner's frame pacer measured every frame
+     * as over budget, never slept, and ran the title at 154 fps under
+     * `--fps 30` (2479 fps uncapped).  Every countdown, animation and sleep
+     * in every title was scaled by the same factor.
+     */
+}
+
+/* ------------------------------------------------------------------ */
+/* Frames                                                              */
+/* ------------------------------------------------------------------ */
+nj_status nj_frame_push(nj_vm *vm, nj_thread *th, nj_method *m,
+                        nj_value *argbase, nj_u2 total_slots)
+{
+    nj_frame *f;
+    nj_value *stk;
+    nj_u2 i;
+
+    if (!vm || !th || !m) {
+        return NJ_ERR;
+    }
+    if (th->nframes >= NJ_MAX_FRAMES) {
+        return nj_throw(vm, "java/lang/StackOverflowError", m->name);
+    }
+    stk = argbase + m->max_locals;
+    if (stk + m->max_stack + 4 > th->stack_end) {
+        return nj_throw(vm, "java/lang/StackOverflowError", m->name);
+    }
+    f = &th->frames[th->nframes++];
+    f->m = m;
+    f->pc = 0u;
+    f->locals = argbase;
+    f->stack = stk;
+    f->sp = stk;
+    /* The operand stack this frame is allowed to use.  A frame in the MIDDLE of
+     * the thread stack used to be bounded only by the global stack_end, so a
+     * method that pushed more than its own max_stack walked into the NEXT
+     * frame's slots - and with a corrupted class file that is a pointer read
+     * from class bytes and dereferenced.  See nj_interp.c for the check. */
+    f->stack_limit = stk + m->max_stack;
+    f->argbase = argbase;
+    f->total_slots = total_slots;
+    f->monitor = NULL;
+    f->is_native = (m->code == NULL) ? 1u : 0u;
+
+    for (i = total_slots; i < m->max_locals; i++) {
+        /* GC scans the whole slot, including native padding on 64-bit hosts. */
+        argbase[i].j = 0;
+    }
+    th->top = stk + m->max_stack;
+    return NJ_OK;
+}
+
+void nj_frame_pop(nj_vm *vm, nj_thread *th)
+{
+    (void)vm;
+    if (!th || th->nframes <= 0) {
+        return;
+    }
+    th->nframes--;
+    th->top = th->frames[th->nframes].locals;
+}
+
+/*
+ * Start a thread on `run` (a no-argument instance method such as run()).
+ * Returns NJ_OK once the first frame is in place.
+ */
+nj_status nj_thread_start(nj_vm *vm, nj_thread *t, nj_method *run)
+{
+    nj_value *base;
+    nj_status st;
+
+    if (!vm || !t || !run) {
+        return NJ_ERR;
+    }
+    if (t->started) {
+        return nj_throw(vm, "java/lang/IllegalThreadStateException", NULL);
+    }
+    base = t->stack_mem;
+    if (run->max_locals < 1u) {
+        return nj_throw(vm, "java/lang/VerifyError", run->name);
+    }
+    base[0].r = t->entry_this ? t->entry_this : t->obj;
+    st = nj_frame_push(vm, t, run, base, 1u);
+    if (st != NJ_OK) {
+        return st;
+    }
+    t->started = 1u;
+    /*
+     * A synchronized run() (very common: `public synchronized void run()`)
+     * owns the receiver's monitor before its first bytecode.  The scheduler
+     * enters run() directly here rather than through interp_invoke(), so the
+     * monitor has to be taken by hand - without this, the first wait() or
+     * notify() inside run() threw IllegalMonitorStateException on titles that
+     * were clean before (two games in the collected corpus).  When another
+     * thread holds it, park before the first bytecode; mon_wake_waiters()
+     * hands the monitor over and records it on the entry frame.
+     */
+    if (run->flags & NJ_ACC_SYNCHRONIZED) {
+        nj_ref mon;
+        int rc;
+
+        if (run->flags & NJ_ACC_STATIC) {
+            mon = nj_class_object(vm, run->owner->name);
+            if (!mon) {
+                nj_frame_pop(vm, t);
+                return NJ_ERR;      /* exception already raised */
+            }
+        } else {
+            mon = base[0].r;
+            if (!mon) {
+                nj_frame_pop(vm, t);
+                return nj_throw(vm, "java/lang/NullPointerException", run->name);
+            }
+        }
+        rc = nj_vm_monitor_enter(vm, t, mon);
+        if (rc == 2) {
+            nj_frame_pop(vm, t);
+            return nj_throw(vm, "java/lang/IllegalStateException",
+                            "too many monitors");
+        }
+        if (rc == 1) {
+            /* Contended: park with the frame in place, monitor unrecorded. */
+            t->wait_monitor = mon;
+            t->wait_kind = NJ_WAIT_ENTER;
+            t->wait_ready = 0u;
+            t->wait_depth = 0u;
+            t->wait_deadline = 0;
+            t->state = NJ_THREAD_BLOCKED;
+            return NJ_OK;
+        }
+        t->frames[t->nframes - 1].monitor = mon;
+    }
+    t->state = NJ_THREAD_RUNNING;
+    return NJ_OK;
+}
+
+nj_status nj_thread_sleep(nj_vm *vm, nj_thread *t, nj_s8 ms)
+{
+    if (!vm || !t) {
+        return NJ_ERR;
+    }
+    if (ms < 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "timeout value is negative");
+    }
+    t->wake_at_ms = nj_now_ms(vm) + ms;
+    t->state = NJ_THREAD_SLEEPING;
+    return NJ_ERR_TIMEOUT;   /* tells the interpreter to suspend this thread */
+}
+
+/* ------------------------------------------------------------------ */
+/* Monitors                                                            */
+/* ------------------------------------------------------------------ */
+/*
+ * The runtime used to treat synchronized as bookkeeping: monitorenter recorded
+ * the monitor on the frame and nothing ever blocked, on the theory that a
+ * cooperatively scheduled thread is never preempted inside a critical section.
+ * That theory was wrong - the quantum runs out in the middle of one - and the
+ * result was a visible data race (tests/lockdemo reports overlap=true against
+ * the unlocked runtime).  A correct Java monitor needs three things:
+ *
+ *   - mutual exclusion: a thread entering a monitor another thread holds parks
+ *     until that other thread leaves it;
+ *   - Object.wait() releases the monitor for the duration of the wait, and the
+ *     thread owns it again when wait() returns - which is why a "woken" thread
+ *     is not runnable until it has reacquired;
+ *   - notify()/notifyAll() require that the caller owns the monitor.
+ *
+ * There is no lock word in the object header: ownership is a scan of the
+ * thread table, which is tiny (NJ_MAX_THREADS), and the GC already walks every
+ * thread's roots.  A blocked thread's saved pc points AT the instruction that
+ * blocked, so resuming it re-executes that instruction; no operand stack has
+ * to be rebuilt.
+ */
+static int mon_index(const nj_thread *t, nj_ref obj)
+{
+    unsigned i;
+    if (!t) {
+        return -1;
+    }
+    for (i = 0u; i < (unsigned)t->nmonitors; i++) {
+        if (t->monitors[i] == obj) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * A thread parked before its first bytecode because the monitor of its
+ * `synchronized run()` was held elsewhere.  nj_thread_start() pushes that
+ * frame at pc 0 and can only record the monitor once it owns it, so the shape
+ * is: BLOCKED on NJ_WAIT_ENTER, top frame is a synchronized Java method, pc 0,
+ * no monitor recorded.  No interpreter-blocked entry has a frame left (the
+ * call was taken back to retry the invoke), so this cannot be confused with
+ * one.
+ */
+static int mon_start_pending(const nj_thread *t)
+{
+    const nj_frame *fr;
+
+    if (!t || t->nframes <= 0) {
+        return 0;
+    }
+    fr = &t->frames[t->nframes - 1];
+    if (!fr->m || !(fr->m->flags & NJ_ACC_SYNCHRONIZED) || fr->monitor) {
+        return 0;
+    }
+    return fr->pc == 0u;
+}
+
+/* 1 when a thread other than `t` owns `obj`. */
+static int mon_owned_elsewhere(const nj_vm *vm, const nj_thread *t, nj_ref obj)
+{
+    nj_u2 i;
+    if (!vm) {
+        return 0;
+    }
+    for (i = 0u; i < vm->nthreads; i++) {
+        const nj_thread *o = vm->threads[i];
+        if (!o || o == t || o->state == NJ_THREAD_DEAD) {
+            continue;
+        }
+        if (mon_index(o, obj) >= 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Push obj with recursion count `depth`: 0 ok, 2 no room for a new monitor. */
+static int mon_push(nj_thread *t, nj_ref obj, nj_u2 depth)
+{
+    if (t->nmonitors >= (nj_u2)NJ_MAX_MONITORS) {
+        return 2;
+    }
+    t->monitors[t->nmonitors] = obj;
+    t->mon_depth[t->nmonitors] = depth;
+    t->nmonitors++;
+    return 0;
+}
+
+/* Remove entry `i`, shifting the inner held monitors down over it. */
+static void mon_remove(nj_thread *t, int i)
+{
+    unsigned k;
+    if (!t || i < 0 || (unsigned)i >= (unsigned)t->nmonitors) {
+        return;
+    }
+    for (k = (unsigned)i; k + 1u < (unsigned)t->nmonitors; k++) {
+        t->monitors[k] = t->monitors[k + 1u];
+        t->mon_depth[k] = t->mon_depth[k + 1u];
+    }
+    t->nmonitors--;
+    t->monitors[t->nmonitors] = NULL;
+    t->mon_depth[t->nmonitors] = 0u;
+}
+
+/*
+ * Hand `obj` back to a thread that is ready to own it again (a notified or
+ * timed-out Object.wait()).  Returns 1 when the thread became runnable.  The
+ * recursion count released by wait() is restored, so a synchronized block that
+ * recursed keeps its depth.
+ */
+static int mon_try_reacquire(nj_vm *vm, nj_thread *t)
+{
+    nj_ref obj = t->wait_monitor;
+    nj_u2 depth;
+
+    if (!t || !obj || t->wait_kind != NJ_WAIT_OBJECT) {
+        return 0;
+    }
+    if (mon_owned_elsewhere(vm, t, obj)) {
+        return 0;
+    }
+    depth = (nj_u2)(t->wait_depth ? t->wait_depth : 1u);
+    if (mon_push(t, obj, depth) != 0) {
+        return 0;   /* cannot happen: wait() removed this very entry */
+    }
+    t->wait_monitor = NULL;
+    t->wait_deadline = 0;
+    t->wait_kind = NJ_WAIT_NONE;
+    t->wait_ready = 0u;
+    t->wait_depth = 0u;
+    t->state = NJ_THREAD_RUNNING;
+    return 1;
+}
+
+/*
+ * `obj` just became free: give it to a ready waiter first (it has to own the
+ * monitor before wait() can return), else make one blocked entrant runnable.
+ * The entrant re-executes monitorenter and either gets it or blocks again.
+ */
+static void mon_wake_waiters(nj_vm *vm, nj_ref obj)
+{
+    nj_u2 i;
+
+    for (i = 0u; i < vm->nthreads; i++) {
+        nj_thread *t = vm->threads[i];
+        if (!t || t == vm->cur || t->state != NJ_THREAD_WAITING) {
+            continue;
+        }
+        if (t->wait_kind == NJ_WAIT_OBJECT && t->wait_monitor == obj &&
+            t->wait_ready && mon_try_reacquire(vm, t)) {
+            return;
+        }
+    }
+    for (i = 0u; i < vm->nthreads; i++) {
+        nj_thread *t = vm->threads[i];
+        if (!t || t == vm->cur || t->state != NJ_THREAD_BLOCKED) {
+            continue;
+        }
+        if (t->wait_kind == NJ_WAIT_ENTER && t->wait_monitor == obj) {
+            if (mon_start_pending(t)) {
+                /*
+                 * Its `synchronized run()` never ran a bytecode yet, so there
+                 * is no monitorenter to re-execute: acquire the monitor for
+                 * it and record it on the entry frame, exactly as if it had
+                 * been free when the thread started.
+                 */
+                if (mon_push(t, obj, 1u) != 0) {
+                    continue;
+                }
+                t->frames[t->nframes - 1].monitor = obj;
+            }
+            t->state = NJ_THREAD_RUNNING;
+            t->wait_monitor = NULL;
+            t->wait_kind = NJ_WAIT_NONE;
+            t->wait_deadline = 0;
+            return;
+        }
+    }
+}
+
+int nj_vm_monitor_enter(nj_vm *vm, nj_thread *t, nj_ref obj)
+{
+    int i;
+
+    if (!t || !obj) {
+        return 0;
+    }
+    i = mon_index(t, obj);
+    if (i >= 0) {
+        if (t->mon_depth[i] == 0xFFFFu) {
+            return 2;
+        }
+        t->mon_depth[i]++;
+        return 0;
+    }
+    if (mon_owned_elsewhere(vm, t, obj)) {
+        t->wait_monitor = obj;
+        t->wait_kind = NJ_WAIT_ENTER;
+        t->wait_ready = 0u;
+        t->wait_depth = 0u;
+        t->wait_deadline = 0;
+        t->state = NJ_THREAD_BLOCKED;
+        return 1;
+    }
+    return mon_push(t, obj, 1u);
+}
+
+int nj_vm_monitor_exit(nj_vm *vm, nj_thread *t, nj_ref obj)
+{
+    int i;
+
+    if (!t || !obj) {
+        return -1;
+    }
+    i = mon_index(t, obj);
+    if (i < 0) {
+        return -1;
+    }
+    /*
+     * Java requires monitors to be released innermost-first.  Code that
+     * violates it cannot be made consistent (the outer exit would have to
+     * leave a monitor it no longer owns), and javac never emits it except
+     * through a finally path, so say no to the jumbled case.
+     */
+    if ((int)t->nmonitors - 1 != i) {
+        return -1;
+    }
+    t->mon_depth[i]--;
+    if (t->mon_depth[i] == 0u) {
+        t->nmonitors = (nj_u2)i;
+        t->monitors[i] = NULL;
+        t->mon_depth[i] = 0u;
+        if (vm) {
+            mon_wake_waiters(vm, obj);
+        }
+    }
+    return 0;
+}
+
+int nj_vm_monitor_owned(const nj_vm *vm, const nj_thread *t, nj_ref obj)
+{
+    (void)vm;
+    return mon_index(t, obj) >= 0;
+}
+
+/*
+ * A waiter whose timeout expired (or whose notifier has already run) asks for
+ * its monitor back.  Returns 1 when the thread owns it again and is runnable;
+ * 0 when somebody else still holds it, in which case the caller must stay
+ * parked - Java says wait() returns WITH the monitor held, never without it.
+ */
+int nj_vm_monitor_reacquire(nj_vm *vm, nj_thread *t)
+{
+    if (!t || t->wait_kind != NJ_WAIT_OBJECT) {
+        return 0;
+    }
+    t->wait_ready = 1u;
+    return mon_try_reacquire(vm, t);
+}
+
+/* Block the current thread on `obj` until notified or the timeout expires. */
+nj_status nj_vm_monitor_wait(nj_vm *vm, nj_thread *t, nj_ref obj, nj_s8 timeout_ms)
+{
+    int i;
+
+    if (!vm || !t) {
+        return NJ_ERR;
+    }
+    i = mon_index(t, obj);
+    if (i < 0) {
+        (void)nj_throw(vm, "java/lang/IllegalMonitorStateException", NULL);
+        return NJ_ERR;
+    }
+    /*
+     * wait() releases the monitor for its whole duration, recursion included.
+     * The entry can sit in the middle of the list when an inner monitor is
+     * still held; removing it from the middle (rather than refusing) is what
+     * makes that legal-but-odd shape representable.  Reacquiring appends it
+     * back before the thread runs again.
+     */
+    t->wait_depth = t->mon_depth[i];
+    mon_remove(t, i);
+    /*
+     * The monitor is free while this thread waits, so a thread that blocked
+     * entering it must be told now - otherwise both threads park for ever and
+     * the scheduler reports a deadlock (tests/lockdemo's first shape).
+     */
+    mon_wake_waiters(vm, obj);
+    t->wait_monitor = obj;
+    t->wait_kind = NJ_WAIT_OBJECT;
+    t->wait_ready = 0u;
+    t->wait_deadline = (timeout_ms == 0) ? 0 : (nj_now_ms(vm) + timeout_ms);
+    t->state = NJ_THREAD_WAITING;
+    return NJ_ERR_TIMEOUT;
+}
+
+/*
+ * Park a thread in serviceRepaints() until the paint that is in flight on
+ * another thread has finished.  A native cannot be resumed, so the call is
+ * not retried: the caller's Java frame simply continues after serviceRepaints
+ * returns, which is what MIDP's blocking contract needs here (the pending
+ * repaint has already been recorded by repaint()).
+ */
+int nj_vm_thread_wait_paint(nj_vm *vm, nj_thread *t)
+{
+    if (!vm || !t || vm->npaint_waiters >= 4u) {
+        return 0;
+    }
+    vm->paint_waiters[vm->npaint_waiters++] = t;
+    t->wait_kind = NJ_WAIT_NONE;
+    t->wait_monitor = NULL;
+    t->wait_ready = 0u;
+    t->wait_depth = 0u;
+    t->wait_deadline = 0;
+    t->state = NJ_THREAD_WAITING;
+    return 1;
+}
+
+/*
+ * The paint that serviceRepaints() callers were waiting for has completed:
+ * wake them so they can continue after the call.  Only the thread that owns
+ * the top-level paint calls this (see nj_midp_paint()).
+ */
+void nj_vm_paint_done(nj_vm *vm)
+{
+    nj_u1 i;
+
+    if (!vm) {
+        return;
+    }
+    for (i = 0u; i < vm->npaint_waiters; i++) {
+        nj_thread *t = vm->paint_waiters[i];
+        if (t && t->state == NJ_THREAD_WAITING) {
+            t->state = NJ_THREAD_RUNNING;
+            t->wait_kind = NJ_WAIT_NONE;
+            t->wait_monitor = NULL;
+            t->wait_deadline = 0;
+        }
+    }
+    vm->npaint_waiters = 0u;
+}
+
+/* 1 when t is parked in serviceRepaints() waiting for the frame boundary. */
+static int pace_waiting(const nj_vm *vm, const nj_thread *t)
+{
+    nj_u1 i;
+
+    if (!vm || !t) {
+        return 0;
+    }
+    for (i = 0u; i < vm->npace_waiters; i++) {
+        if (vm->pace_waiters[i] == t) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Park a scheduler-owned thread in serviceRepaints() until the current frame
+ * ends.  A native cannot be resumed, so the call is not retried: the caller's
+ * Java frame continues after serviceRepaints() returns, which lets a title
+ * whose loop is `repaint(); serviceRepaints(); step();` run one iteration per
+ * display frame instead of spinning for the whole frame budget.
+ */
+int nj_vm_thread_wait_frame(nj_vm *vm, nj_thread *t)
+{
+    if (!vm || !t || vm->npace_waiters >= 4u) {
+        return 0;
+    }
+    vm->pace_waiters[vm->npace_waiters++] = t;
+    t->wait_kind = NJ_WAIT_NONE;
+    t->wait_monitor = NULL;
+    t->wait_ready = 0u;
+    t->wait_depth = 0u;
+    t->wait_deadline = 0;
+    t->state = NJ_THREAD_WAITING;
+    return 1;
+}
+
+/*
+ * The frame is over: a paint loop that was paced by serviceRepaints() may run
+ * its next iteration.  Called by the frame pump when the outermost frame
+ * returns (see frame_return() in nj_lib_midlet.c).
+ */
+void nj_vm_frame_done(nj_vm *vm)
+{
+    nj_u1 i;
+
+    if (!vm) {
+        return;
+    }
+    for (i = 0u; i < vm->npace_waiters; i++) {
+        nj_thread *t = vm->pace_waiters[i];
+        if (t && t->state == NJ_THREAD_WAITING) {
+            t->state = NJ_THREAD_RUNNING;
+            t->wait_kind = NJ_WAIT_NONE;
+            t->wait_monitor = NULL;
+            t->wait_deadline = 0;
+        }
+    }
+    vm->npace_waiters = 0u;
+}
+
+/* Wake up to `count` threads waiting on `obj`.  Returns the number woken. */
+int nj_vm_monitor_notify(nj_vm *vm, nj_ref obj, int all)
+{
+    nj_u2 i;
+    int woken = 0;
+
+    if (!vm) {
+        return 0;
+    }
+    for (i = 0u; i < vm->nthreads; i++) {
+        nj_thread *t = vm->threads[i];
+        if (!t || t == vm->cur) {
+            continue;
+        }
+        if (t->state != NJ_THREAD_WAITING || t->wait_monitor != obj) {
+            continue;
+        }
+        if (t->wait_kind == NJ_WAIT_OBJECT) {
+            if (t->wait_ready) {
+                continue;
+            }
+            t->wait_ready = 1u;
+            /*
+             * The notifier normally still owns obj, so this fails here and
+             * succeeds in nj_vm_monitor_exit() when it lets go.  Trying anyway
+             * keeps notify() that meets no owner from parking the waiter for
+             * ever - Thread.join() wakeups take exactly this path.
+             */
+            (void)mon_try_reacquire(vm, t);
+        } else {
+            t->state = NJ_THREAD_RUNNING;
+            t->wait_monitor = NULL;
+            t->wait_kind = NJ_WAIT_NONE;
+            t->wait_deadline = 0;
+        }
+        woken++;
+        if (!all) {
+            break;
+        }
+    }
+    return woken;
+}
+
+/* ------------------------------------------------------------------ */
+/* Scheduler                                                           */
+/* ------------------------------------------------------------------ */
+static nj_status scheduler_step(nj_vm *vm, int *out_real_work)
+{
+    nj_u2 i;
+    int alive = 0;
+    int waiting = 0;
+    int ran = 0;
+    int real_work = 0;
+    /*
+     * A thread woken while parked inside a nested C call is runnable but must
+     * not be entered from here: its C stack belongs to the pump that will
+     * resume it.  Such a thread is progress, not a deadlock.
+     */
+    int parked_ready = 0;
+    /* A thread parked in serviceRepaints() for the frame boundary.  The frame
+     * pump is about to run, so it is progress, not a deadlock. */
+    int frame_waiting = 0;
+    nj_s8 now;
+    nj_s8 earliest = 0;
+    int have_earliest = 0;
+
+    if (!vm || !vm->running) {
+        return NJ_ERR_HALT;
+    }
+    nj_thread_reap(vm);
+    now = nj_now_ms(vm);
+
+    for (i = 0u; i < vm->nthreads; i++) {
+        nj_thread *t = vm->threads[i];
+        nj_status st;
+
+        if (!t || t->state == NJ_THREAD_DEAD) {
+            continue;
+        }
+        alive = 1;
+
+        if (t->state == NJ_THREAD_SLEEPING) {
+            if (now >= t->wake_at_ms) {
+                t->state = NJ_THREAD_RUNNING;
+            } else {
+                nj_s8 w = t->wake_at_ms;
+                if (!have_earliest || w < earliest) {
+                    earliest = w;
+                    have_earliest = 1;
+                }
+                continue;
+            }
+        }
+        if (t->state == NJ_THREAD_BLOCKED) {
+            /*
+             * Parked wanting a monitor another thread holds.  Its pc points at
+             * the instruction that blocked, so becoming runnable again is all
+             * it needs; there is no deadline to time it out with.
+             */
+            waiting++;
+            continue;
+        }
+        if (t->state == NJ_THREAD_WAITING && pace_waiting(vm, t)) {
+            /*
+             * Waiting for the frame boundary, which the frame pump delivers
+             * after this scheduler pass returns.  It is progress, not a
+             * deadlock: the painter is the frame loop itself.
+             */
+            waiting++;
+            frame_waiting = 1;
+            continue;
+        }
+        if (t->state == NJ_THREAD_WAITING) {
+            if (t->wait_kind == NJ_WAIT_OBJECT) {
+                /*
+                 * A notified or timed-out Object.wait() does not run the Java
+                 * code after wait() yet: it reacquires the monitor first.
+                 * Until then it stays parked (and counted as waiting, so the
+                 * deadlock check below still sees it).
+                 */
+                if (!t->wait_ready && t->wait_deadline != 0 &&
+                    now >= t->wait_deadline) {
+                    t->wait_ready = 1u;
+                    t->wait_deadline = 0;
+                }
+                if (!(t->wait_ready && mon_try_reacquire(vm, t))) {
+                    waiting++;
+                    continue;
+                }
+            } else if (t->wait_deadline != 0 && now >= t->wait_deadline) {
+                t->state = NJ_THREAD_RUNNING;
+                t->wait_monitor = NULL;
+                t->wait_kind = NJ_WAIT_NONE;
+                t->wait_deadline = 0;
+            } else {
+                nj_s8 w = t->wait_deadline;
+                waiting++;
+                if (w != 0 && (!have_earliest || w < earliest)) {
+                    earliest = w;
+                    have_earliest = 1;
+                }
+                continue;
+            }
+        }
+        if (t->state != NJ_THREAD_RUNNING) {
+            continue;
+        }
+        /*
+         * Parked inside a nested C call: its C stack belongs to a native that
+         * is still running (or to the pump waiting for it), and the top frame
+         * on that stack is the NATIVE's, with code_len 0.  Running it here
+         * would fetch an opcode out of an empty method - five collected
+         * titles reported exactly that as
+         *   VerifyError: code runs past the end of the method
+         * at nj2me/util/TimerThread.pump pc=0.  The pump that owns the stack
+         * notices the thread becoming runnable and resumes it itself, so all
+         * this loop owes the thread is the deadline accounting above (which
+         * is why the check sits after it, not before: a thread parked in
+         * Thread.sleep() inside a native still has to set `earliest`, or the
+         * loop below mistakes "one thread asleep, one waiting" for a
+         * deadlock - 极品飞车16：亡命狂飙_1519 died that way).
+         */
+        if (t->in_c_call) {
+            if (t->state == NJ_THREAD_RUNNING) {
+                parked_ready = 1;
+            }
+            continue;
+        }
+
+        /*
+         * A thread that has no frames left has finished its run() method:
+         * `nj_exec` on an empty stack returns NJ_OK (it has nothing to do),
+         * so without this check the slot stayed NJ_THREAD_RUNNING for ever,
+         * the scheduler kept walking it, and the title eventually ran out of
+         * thread slots ("too many threads").  Only scheduler-owned threads
+         * reach here: the main thread and natives parked in a C call are
+         * filtered above.
+         */
+        if (t->nframes == 0u && !t->is_main) {
+            t->state = NJ_THREAD_DEAD;
+            continue;
+        }
+        ran = 1;
+        if (!t->is_main) {
+            /* An empty main-thread pass is not work: the C runner owns the
+             * frame and nj_exec() on an empty stack returns immediately.
+             * Callers that spend idle time (the frame pacer) need to know
+             * the difference between "a MIDlet thread made progress" and
+             * "only the empty main pass was walked". */
+            real_work = 1;
+        }
+        vm->cur = t;
+        st = nj_exec(vm, t, 0);
+
+        if (st == NJ_ERR_HALT) {
+            t->state = NJ_THREAD_DEAD;
+            /* An uncaught exception propagates out of the thread. */
+            if (vm->exception) {
+                const char *desc = nj_exception_describe(vm);
+                nj_ref e = nj_take_exception(vm);
+                if (t->is_main) {
+                    return NJ_ERR;
+                }
+                /* Full description, not just the class: an uncaught
+                 * IllegalArgumentException with no message is barely more
+                 * useful than a blank screen. */
+                nj_logf(vm, 1, "uncaught exception in thread %u: %s",
+                        (unsigned)t->id,
+                        desc ? desc : (e && e->cls ? e->cls->name : "?"));
+            }
+        } else if (st == NJ_OK && !t->is_main && t->started &&
+                   t->nframes == 0 && t->obj) {
+            nj_field *f = nj_field_lookup(vm, "java/lang/Thread", "alive", "Z", 0);
+            /* nj_exec has returned from the worker's bottom Java frame. A
+             * nested C invocation is excluded above by in_c_call. Publish
+             * completion to isAlive()/join(), but retain the legacy scheduler
+             * state: constructor frame-hook pumps currently depend on its idle
+             * timing (Doom/Doom's untimed startup wait in particular). */
+            if (f && nj_field_read_int(vm, t->obj, f)) {
+                nj_field_write_int(vm, t->obj, f, 0);
+                (void)nj_vm_monitor_notify(vm, t->obj, 1);
+            }
+            if (t->obj->cls &&
+                strcmp(t->obj->cls->name, "nj2me/util/TimerThread") == 0) {
+                t->state = NJ_THREAD_DEAD;
+            }
+        } else if (st != NJ_OK && st != NJ_ERR_YIELD && st != NJ_ERR_TIMEOUT) {
+            return st;
+        }
+    }
+
+    if (out_real_work != NULL) {
+        *out_real_work = real_work;
+    }
+    if (!alive) {
+        return NJ_ERR_HALT;
+    }
+    if (!ran) {
+        if (parked_ready && !have_earliest) {
+            /*
+             * The only thread that could move is parked inside its own C
+             * call; the pump resumes it as soon as this pass returns.  Idle
+             * instead of sleeping for a deadline (there may be none) and
+             * instead of declaring a deadlock.
+             */
+            port_idle(vm);
+        } else if (parked_ready) {
+            /*
+             * A thread parked in its C call resumes by itself, but a Java
+             * thread asleep on the clock only wakes when time moves, and
+             * port_idle() does not move it.  A paint() that spins waiting for
+             * its loader thread's sleep (明星制造梦工厂_11048) therefore never
+             * saw it wake.  Advance the clock a little; the cap keeps the
+             * parked pump from being held back noticeably.
+             */
+            nj_s8 delta = earliest - now;
+            if (delta > 0) {
+                port_sleep(vm, (nj_u4)(delta > 5 ? 5 : delta));
+            }
+        } else if (have_earliest) {
+            nj_s8 delta = earliest - now;
+            if (delta > 0) {
+                port_sleep(vm, (nj_u4)(delta > 50 ? 50 : delta));
+            }
+        } else if (waiting > 0 && !frame_waiting) {
+            /* Every remaining thread is parked on Object.wait() or blocked on
+             * a monitor nobody will release: this is a genuine deadlock. */
+            nj_logf(vm, 1, "all threads are waiting; assuming the app is done");
+            return NJ_ERR_HALT;
+        } else {
+            /* Only threads waiting for the frame boundary are left: the frame
+             * pump paints and wakes them as soon as this pass returns. */
+            port_idle(vm);
+        }
+    }
+    return NJ_OK;
+}
+
+/*
+ * Run every runnable thread for one quantum, then hand control back to the
+ * MIDlet's own thread.
+ *
+ * Returns NJ_OK when at least one thread ran, NJ_ERR_HALT when every thread is
+ * dead (the program is over), or NJ_ERR_STATE on a deadlock that cannot be
+ * resolved by waiting (all remaining threads blocked on wait()).
+ */
+nj_status nj_scheduler_step(nj_vm *vm)
+{
+    nj_thread *main_thread = nj_thread_main(vm);
+    nj_status st = scheduler_step(vm, NULL);
+
+    /*
+     * scheduler_step points vm->cur at each thread it runs, which is right
+     * while that thread is executing and wrong the moment this returns: the
+     * caller is C again (nj_midp_frame drains key events, then paints) and
+     * vm_invoke starts from vm->cur.  A MIDlet whose own game thread parks in
+     * Thread.sleep() therefore had its key callbacks and paint() dispatched on
+     * a sleeping thread: nj_exec yielded at once, vm_invoke turned that into
+     * NJ_ERR_TIMEOUT, and the canvas logged "paint() failed without raising an
+     * exception" every frame while the keys went nowhere.
+     */
+    if (main_thread) {
+        vm->cur = main_thread;
+    }
+    return st;
+}
+
+/* Give background computation a bounded share of a display frame.  A
+ * bytecode quantum is a fairness boundary, not a reason to sleep until the
+ * next video frame: software renderers often need many quanta per image.
+ * Stop when the application presents, blocks, or uses its host-time budget.
+ * The round limit also bounds ports with a coarse or stationary clock. */
+nj_status nj_scheduler_frame(nj_vm *vm, nj_u4 budget_ms)
+{
+    nj_s8 start = nj_now_ms(vm);
+    unsigned rounds = 0u;
+    nj_status st;
+    do {
+        nj_u2 i;
+        int runnable = 0;
+        st = nj_scheduler_step(vm);
+        if (st != NJ_OK || !vm->running || vm->painted_in_frame ||
+            ++rounds >= 256u ||
+            nj_now_ms(vm) - start >= (nj_s8)budget_ms) {
+            break;
+        }
+        for (i = 0; i < vm->nthreads; ++i) {
+            nj_thread *th = vm->threads[i];
+            if (th && th->state == NJ_THREAD_RUNNING && th->nframes &&
+                !th->in_c_call) {
+                runnable = 1;
+                break;
+            }
+        }
+        if (!runnable) break;
+    } while (1);
+    return st;
+}
+
+/*
+ * 1 when the VM has any scheduler-owned thread at all, sleeping or not.
+ *
+ * The frame pacer asks this before handing the inter-frame gap to the MIDlet's
+ * own threads.  It must still call into the scheduler then: a sleeping thread
+ * only wakes because the scheduler advances its deadline, and "no thread is
+ * runnable right now" is exactly the state of a loader between its chunks.
+ * Without it the only options are a host sleep - which stops every Java thread
+ * and made a loader take (frame time / slice) times longer than it does on a
+ * phone - or a call that cannot say "nothing to run", which on a port whose
+ * idle() is a no-op (the headless one) spins a core flat out.
+ */
+int nj_scheduler_has_threads(nj_vm *vm)
+{
+    nj_u2 i;
+
+    if (vm == NULL) {
+        return 0;
+    }
+    for (i = 0u; i < vm->nthreads; i++) {
+        nj_thread *t = vm->threads[i];
+
+        if (t != NULL && !t->is_main) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Run the scheduler until every thread is dead or `budget_ms` elapses. */
+nj_status nj_scheduler_run_until_idle(nj_vm *vm, nj_u4 budget_ms)
+{
+    nj_s8 start = nj_now_ms(vm);
+
+    for (;;) {
+        int real_work = 0;
+        nj_status st = scheduler_step(vm, &real_work);
+        if (st == NJ_ERR_HALT) {
+            return NJ_OK;
+        }
+        if (st != NJ_OK) {
+            return st;
+        }
+        if (budget_ms && (nj_now_ms(vm) - start) > (nj_s8)budget_ms) {
+            return NJ_ERR_TIMEOUT;
+        }
+        /*
+         * No MIDlet thread moved.  Spinning in this call until the budget
+         * expires is what made a capped run burn a core: an empty main-thread
+         * pass counted as work, so the idle branches never ran.  Return early
+         * instead and let the caller - the frame pacer - sleep against its own
+         * frame deadline, which this function cannot know.
+         */
+        if (!real_work) {
+            return NJ_ERR_TIMEOUT;
+        }
+    }
+}
+
+void nj_vm_stop(nj_vm *vm, nj_s4 exit_code)
+{
+    if (!vm) {
+        return;
+    }
+    vm->exit_code = exit_code;
+    vm->running = 0u;
+    vm->state = NJ_VM_STOPPING;
+}
+
+/*
+ * Stop the VM, saying who asked for it.
+ *
+ * "Nothing was ever presented" and "the MIDlet called notifyDestroyed() in its
+ * first frame" leave the same empty frame directory, and telling them apart is
+ * the difference between a missing class and a game that quit on purpose.  The
+ * reason is a string literal: nothing here allocates, so nothing can leak.
+ */
+void nj_vm_stop_reason(nj_vm *vm, nj_s4 exit_code, const char *why)
+{
+    if (!vm) {
+        return;
+    }
+    nj_vm_stop(vm, exit_code);
+    vm->stop_why = why;
+}
+
+const char *nj_vm_stop_why(const nj_vm *vm)
+{
+    return vm ? vm->stop_why : NULL;
+}

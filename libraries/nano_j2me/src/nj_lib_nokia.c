@@ -1,0 +1,3183 @@
+/*
+ * nano_j2me - nj_lib_nokia.c
+ *
+ * The Nokia UI API: the handful of `com.nokia.mid.ui` calls that a Series 40
+ * game makes and that have no meaning on a device without Nokia's keypad.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THESE ARE NO-OPS, AND WHY THAT IS CORRECT
+ * ---------------------------------------------------------------------------
+ * `VirtualKeyboard.hideOpenKeypadCommand(true)` asks the device to take the
+ * on-screen keypad away.  A desktop has no on-screen keypad, so there is
+ * nothing to hide and the honest implementation is to do nothing and return.
+ * That is different from the JSR 211 stub next door, which THROWS: there,
+ * "share this score" is a request that genuinely cannot be satisfied and the
+ * game needs to know; here the request is already satisfied.
+ *
+ * A class that exists and does nothing is not the same as a class that is
+ * absent.  The first third-party game built from source here needed this class
+ * to EXIST - it named it in its constructor - and NoClassDefFoundError ended the
+ * run before the first frame was drawn.
+ */
+#include "nj_midp.h"
+
+#include <math.h>
+
+#define NJFN(name) NJ_NATIVE_FN(name)
+
+#define NJ_C_VKEYBOARD "com/nokia/mid/ui/VirtualKeyboard"
+#define NJ_C_MPLISTEN  "com/nokia/mid/ui/multipointtouch/MultipointTouchListener"
+#define NJ_C_MPTOUCH   "com/nokia/mid/ui/multipointtouch/MultipointTouch"
+#define NJ_C_DEVCTL   "com/nokia/mid/ui/DeviceControl"
+#define NJ_C_DUTILS    "com/nokia/mid/ui/DirectUtils"
+#define NJ_C_DGRAPHICS "com/nokia/mid/ui/DirectGraphics"
+#define NJ_C_GRAPHICS "javax/microedition/lcdui/Graphics"
+#define NJ_C_TEXTEDITOR "com/nokia/mid/ui/TextEditor"
+#define NJ_C_TELISTENER "com/nokia/mid/ui/TextEditorListener"
+#define NJ_C_FSELECT   "com/nokia/mid/ui/FileSelect"
+#define NJ_C_FSDETAIL  "com/nokia/mid/ui/FileSelectDetail"
+#define NJ_C_SOUND     "com/nokia/mid/sound/Sound"
+/*
+ * Vendor vibration APIs.  They live in this module because it is already the
+ * home of the handset-specific classes, and because a separate translation
+ * unit would have to be registered in three build systems for two tiny
+ * classes.  See the Samsung and Motorola sections below.
+ */
+#define NJ_C_SVIB      "com/samsung/util/Vibration"
+#define NJ_C_MVIB      "com/motorola/multimedia/Vibrator"
+#define NJ_C_SLISTEN   "com/nokia/mid/sound/SoundListener"
+#define NJ_C_DGIMPL   "com/nokia/mid/ui/DirectGraphicsImplemented"
+#define NJ_C_CLIPBOARD "com/nokia/mid/ui/Clipboard"
+#define NJ_C_GLOBIND   "com/nokia/mid/ui/GlobalIndicators"
+#define NJ_C_GLOBINDEXC "com/nokia/mid/ui/GlobalIndicatorsException"
+#define NJ_C_TACTILE   "com/nokia/mid/ui/TactileFeedback"
+#define NJ_C_SOFTNOTIF "com/nokia/mid/ui/SoftNotification"
+#define NJ_C_SNIMPL    "com/nokia/mid/ui/SoftNotificationImpl"
+#define NJ_C_SNEXC     "com/nokia/mid/ui/SoftNotificationException"
+#define NJ_C_SNLISTEN  "com/nokia/mid/ui/SoftNotificationListener"
+#define NJ_C_JOYLISTEN "com/nokia/mid/ui/JoystickEventListener"
+#define NJ_C_GESTLISTEN "com/nokia/mid/ui/gestures/GestureListener"
+#define NJ_C_GESTEVENT "com/nokia/mid/ui/gestures/GestureEvent"
+#define NJ_C_GESTZONE  "com/nokia/mid/ui/gestures/GestureInteractiveZone"
+#define NJ_C_GESTMGR   "com/nokia/mid/ui/gestures/GestureRegistrationManager"
+
+/*
+ * MultipointTouch.
+ *
+ * Two generations of this API exist.  The Series 40 form is a static
+ * setMultipointTouchListener(); the Asha form - which Minecraft PE 0.6.1
+ * uses - asks for a singleton with getInstance(), registers with an instance
+ * method, and reads each pointer with static getState()/getX()/getY().
+ *
+ * Both are answered from one per-VM instance, and that lets the runtime feed
+ * the pointer events the port already reports (desktop mouse, touchscreen,
+ * the --keys pointer entries) into the listener.  A title built for a
+ * touchscreen then drives its own touch UI instead of having to be played
+ * through the keypad.  A port that reports one pointer reports id 0, which is
+ * what a single-touch handset does too.
+ */
+#define MPT_MAX_POINTERS 4
+#define MPT_PRESSED      0
+#define MPT_DRAGGED      1
+#define MPT_RELEASED     2
+
+static nj_field *mpt_f(nj_vm *vm, const char *name, const char *desc,
+                       int is_static)
+{
+    return nj_field_lookup(vm, NJ_C_MPTOUCH, name, desc, is_static);
+}
+
+static nj_ref mpt_instance(nj_vm *vm)
+{
+    return nj_field_read_ref(vm, NULL,
+                             mpt_f(vm, "_nj_instance", "L" NJ_C_MPTOUCH ";", 1));
+}
+
+static nj_ref mpt_array(nj_vm *vm, nj_ref inst, const char *name)
+{
+    return nj_field_read_ref(vm, inst, mpt_f(vm, name, "[I", 0));
+}
+
+/* Every pointer starts released; x/y start at the origin. */
+static void mpt_seed(nj_vm *vm, nj_ref inst)
+{
+    static const char *names[3] = { "_nj_state", "_nj_x", "_nj_y" };
+    nj_s4 initial[3];
+    int k;
+
+    initial[0] = MPT_RELEASED;
+    initial[1] = 0;
+    initial[2] = 0;
+    for (k = 0; k < 3; k++) {
+        nj_ref a = mpt_array(vm, inst, names[k]);
+        nj_s4 *p = a ? (nj_s4 *)nj_array_data(a) : NULL;
+        int i;
+        for (i = 0; p && i < MPT_MAX_POINTERS; i++) {
+            p[i] = initial[k];
+        }
+    }
+}
+
+NJFN(nokia_mpt_init)     { return NJ_OK; }
+
+static nj_ref mpt_make(nj_vm *vm, nj_thread *th, nj_value *args, nj_value *ret)
+{
+    nj_ref inst = mpt_instance(vm), st, xs, ys;
+    nj_u4 mark;
+
+    if (inst) {
+        return inst;
+    }
+    mark = nj_root_mark(vm);
+    inst = nj_root(vm, nj_object_new(vm, NJ_C_MPTOUCH));
+    if (!inst) {
+        nj_root_release(vm, mark);
+        (void)nj_throw_oom(vm);
+        return NULL;
+    }
+    st = nj_root(vm, nj_array_new(vm, "I", MPT_MAX_POINTERS));
+    xs = nj_root(vm, nj_array_new(vm, "I", MPT_MAX_POINTERS));
+    ys = nj_root(vm, nj_array_new(vm, "I", MPT_MAX_POINTERS));
+    if (!st || !xs || !ys) {
+        nj_root_release(vm, mark);
+        (void)nj_throw_oom(vm);
+        return NULL;
+    }
+    nj_field_write_ref(vm, inst, mpt_f(vm, "_nj_state", "[I", 0), st);
+    nj_field_write_ref(vm, inst, mpt_f(vm, "_nj_x", "[I", 0), xs);
+    nj_field_write_ref(vm, inst, mpt_f(vm, "_nj_y", "[I", 0), ys);
+    mpt_seed(vm, inst);
+    nj_field_write_ref(vm, NULL,
+                       mpt_f(vm, "_nj_instance", "L" NJ_C_MPTOUCH ";", 1), inst);
+    (void)th;
+    (void)args;
+    (void)ret;
+    nj_root_release(vm, mark);
+    return mpt_instance(vm);
+}
+
+NJFN(nokia_mpt_instance)
+{
+    nj_ref inst = mpt_make(vm, th, args, ret);
+    if (!inst) {
+        return NJ_ERR;
+    }
+    ret->r = inst;
+    return NJ_OK;
+}
+
+NJFN(nokia_mpt_add)
+{
+    nj_ref self = NJ_THIS(args), listener = NJ_ARG_REF(args, 0);
+
+    if (!self) {                    /* the legacy static form */
+        self = mpt_make(vm, th, args, ret);
+    }
+    if (!self) {
+        return NJ_ERR;
+    }
+    nj_field_write_ref(vm, self,
+                       mpt_f(vm, "_nj_listener", "L" NJ_C_MPLISTEN ";", 0),
+                       listener);
+    mpt_seed(vm, self);
+    return NJ_OK;
+}
+
+NJFN(nokia_mpt_remove)
+{
+    nj_ref self = NJ_THIS(args), listener = NJ_ARG_REF(args, 0);
+    nj_ref current;
+
+    if (!self) {
+        self = mpt_make(vm, th, args, ret);
+    }
+    if (!self) {
+        return NJ_ERR;
+    }
+    current = nj_field_read_ref(
+        vm, self, mpt_f(vm, "_nj_listener", "L" NJ_C_MPLISTEN ";", 0));
+    if (!listener || current == listener) {
+        nj_field_write_ref(vm, self,
+                           mpt_f(vm, "_nj_listener", "L" NJ_C_MPLISTEN ";", 0),
+                           NULL);
+    }
+    return NJ_OK;
+}
+
+static nj_s4 mpt_get(nj_vm *vm, nj_s4 id, const char *name)
+{
+    nj_ref inst = mpt_instance(vm), a;
+    const nj_s4 *p;
+
+    if (!inst) {
+        return 0;
+    }
+    a = mpt_array(vm, inst, name);
+    if (!a || id < 0 || (nj_u4)id >= a->length) {
+        return 0;
+    }
+    p = (const nj_s4 *)nj_array_data(a);
+    return p ? p[id] : 0;
+}
+
+NJFN(nokia_mpt_get_state)
+{
+    ret->i = mpt_get(vm, NJ_ARG_INT(args, 0), "_nj_state");
+    return NJ_OK;
+}
+
+NJFN(nokia_mpt_get_x)
+{
+    ret->i = mpt_get(vm, NJ_ARG_INT(args, 0), "_nj_x");
+    return NJ_OK;
+}
+
+NJFN(nokia_mpt_get_y)
+{
+    ret->i = mpt_get(vm, NJ_ARG_INT(args, 0), "_nj_y");
+    return NJ_OK;
+}
+
+/*
+ * One pointer event, already in canvas coordinates, for finger `id`.  Called
+ * once per finger by the MIDP dispatch, so the listener sees the same presses
+ * and drags a multitouch handset would have reported.  The per-pointer record
+ * is updated even before a listener registers, because getState()/getX()/getY()
+ * are readable then.
+ */
+void nj_nokia_mpt_pointer(nj_vm *vm, int id, int x, int y, int kind)
+{
+    nj_ref inst, listener, a;
+    nj_s4 *p;
+    nj_s4 state;
+    nj_u4 mark;
+    nj_value arg[1];
+
+    if (!vm || id < 0) {
+        return;
+    }
+    if (id >= MPT_MAX_POINTERS) {
+        id = MPT_MAX_POINTERS - 1;
+    }
+    inst = mpt_instance(vm);
+    if (!inst) {
+        return;
+    }
+    state = (kind == NJ_POINTER_DOWN) ? MPT_PRESSED
+          : (kind == NJ_POINTER_MOVE) ? MPT_DRAGGED : MPT_RELEASED;
+    a = mpt_array(vm, inst, "_nj_state");
+    p = a ? (nj_s4 *)nj_array_data(a) : NULL;
+    if (p && a->length > (nj_u4)id) { p[id] = state; }
+    a = mpt_array(vm, inst, "_nj_x");
+    p = a ? (nj_s4 *)nj_array_data(a) : NULL;
+    if (p && a->length > (nj_u4)id) { p[id] = (nj_s4)x; }
+    a = mpt_array(vm, inst, "_nj_y");
+    p = a ? (nj_s4 *)nj_array_data(a) : NULL;
+    if (p && a->length > (nj_u4)id) { p[id] = (nj_s4)y; }
+    nj_logf(vm, 3, "nokia mpt: pointer %d state %d at %d,%d", id, (int)state,
+            x, y);
+
+    listener = nj_field_read_ref(
+        vm, inst, mpt_f(vm, "_nj_listener", "L" NJ_C_MPLISTEN ";", 0));
+    if (!listener) {
+        return;
+    }
+    mark = nj_root_mark(vm);
+    nj_root(vm, inst);
+    nj_root(vm, listener);
+    a = nj_root(vm, nj_array_new(vm, "I", 1u));
+    if (a) {
+        ((nj_s4 *)nj_array_data(a))[0] = (nj_s4)id;
+        arg[0].r = a;
+        (void)nj_call(vm, listener, nj_ref_class_name(listener),
+                      "pointersChanged", "([I)V", arg, NULL);
+    }
+    nj_root_release(vm, mark);
+}
+
+/*
+ * FileSelect.  A UI SERVICE, not an API this runtime can satisfy: on a phone it
+ * opens a device dialog over the MIDlet and returns what the user picked.  There
+ * is no such dialog here, and returning an empty array would be indistinguishable
+ * from "the user picked nothing" - so it REFUSES, and the game's own catch
+ * handles it.  That is the same choice JSR 211 makes next door.
+ */
+NJFN(nokia_fselect_launch)
+{
+    return nj_throw(vm, "java/lang/UnsupportedOperationException",
+                    "com.nokia.mid.ui.FileSelect.launch needs a device file "
+                    "dialog, which this runtime does not have");
+}
+
+/*
+ * Give the constants their values.  Runs once when the VM is up, for the same
+ * reason LCDUI has a late init: a builtin class cannot carry a ConstantValue,
+ * so a static final that is never written reads 0 - and a MIDlet comparing
+ * against 0 gets the wrong branch with nothing to show for it.
+ */
+static void nokia_const_int(nj_vm *vm, const char *cls, const char *name,
+                            nj_s4 value)
+{
+    nj_field *f = nj_field_lookup(vm, cls, name, "I", 1);
+    if (f) {
+        nj_field_write_int(vm, NULL, f, value);
+    }
+}
+
+nj_status nj_nokia_late_init(nj_vm *vm);
+
+nj_status nj_nokia_late_init(nj_vm *vm)
+{
+    if (!vm) {
+        return NJ_ERR;
+    }
+    nokia_const_int(vm, NJ_C_FSELECT, "FILE_SYSTEM_PHONE", 1);
+    nokia_const_int(vm, NJ_C_FSELECT, "FILE_SYSTEM_MMC", 2);
+    nokia_const_int(vm, NJ_C_FSELECT, "FILE_SYSTEM_ALL", 3);
+    nokia_const_int(vm, NJ_C_FSELECT, "MEDIA_TYPE_IMAGE", 1);
+    nokia_const_int(vm, NJ_C_FSELECT, "MEDIA_TYPE_VIDEO", 2);
+    nokia_const_int(vm, NJ_C_FSELECT, "MEDIA_TYPE_AUDIO", 4);
+    nokia_const_int(vm, NJ_C_FSELECT, "MEDIA_TYPE_APPLICATION", 8);
+    nokia_const_int(vm, NJ_C_FSELECT, "MEDIA_TYPE_ALL", 16);
+    /* MultipointTouch pointer states, read by the MIDlet from the class. */
+    nokia_const_int(vm, NJ_C_MPTOUCH, "POINTER_PRESSED",  MPT_PRESSED);
+    nokia_const_int(vm, NJ_C_MPTOUCH, "POINTER_DRAGGED",  MPT_DRAGGED);
+    nokia_const_int(vm, NJ_C_MPTOUCH, "POINTER_RELEASED", MPT_RELEASED);
+    /* Round 154 families. */
+    nokia_const_int(vm, NJ_C_GLOBIND, "MAIL_INDICATOR", 274);
+    nokia_const_int(vm, NJ_C_GLOBIND, "CHAT_INDICATOR", 260);
+    nokia_const_int(vm, NJ_C_GLOBIND, "INDICATOR_UNINITIALIZED", 0);
+    nokia_const_int(vm, NJ_C_GLOBIND, "INDICATOR_HIDE", 1);
+    nokia_const_int(vm, NJ_C_GLOBIND, "INDICATOR_SHOW", 2);
+    nokia_const_int(vm, NJ_C_TACTILE, "FEEDBACK_STYLE_BASIC", 1);
+    nokia_const_int(vm, NJ_C_TACTILE, "FEEDBACK_STYLE_SENSITIVE", 2);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_TAP", 1);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_LONG_PRESS", 2);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_LONG_PRESS_REP", 4);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_DRAG", 8);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_FLICK", 16);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_PINCH", 32);
+    nokia_const_int(vm, NJ_C_GESTZONE, "GESTURE_DOUBLE_TAP", 64);
+
+
+    /*
+     * These numbers come from Nokia's own class library rather than from a
+     * stub: the Nokia 5100 SDK's lib/classes.zip answers
+     * `javap -constants com.nokia.mid.sound.Sound` with SOUND_PLAYING = 0,
+     * SOUND_STOPPED = 1 and SOUND_UNINITIALIZED = 3, so a MIDlet that compares
+     * getState() with the constant sees the same pair a handset produced.
+     * SOUND_UNPLAYABLE is not in that SDK; 2 is kept because a title compiled
+     * against a stub may reference it, and it collides with no Nokia value.
+     */
+    nokia_const_int(vm, NJ_C_SOUND, "FORMAT_TONE", 1);
+    nokia_const_int(vm, NJ_C_SOUND, "FORMAT_WAV", 5);   /* the spec value; the
+                                                         * formats array below
+                                                         * has always answered 5 */
+    nokia_const_int(vm, NJ_C_SOUND, "SOUND_STOPPED", 1);
+    nokia_const_int(vm, NJ_C_SOUND, "SOUND_PLAYING", 0);
+    nokia_const_int(vm, NJ_C_SOUND, "SOUND_UNPLAYABLE", 2);
+
+    /* Motorola Vibrator tones, from its own class file. */
+    nokia_const_int(vm, NJ_C_MVIB, "VIBRATE_SILENT", 0);
+    nokia_const_int(vm, NJ_C_MVIB, "VIBRATE_2SHORT", 1);
+    nokia_const_int(vm, NJ_C_MVIB, "VIBRATE_LONG", 2);
+    nokia_const_int(vm, NJ_C_MVIB, "VIBRATE_PULSE", 3);
+    nokia_const_int(vm, NJ_C_MVIB, "VIBRATE_SHORT", 4);
+    nokia_const_int(vm, NJ_C_MVIB, "VIBRATE_SHORT_LONG", 5);
+    nokia_const_int(vm, NJ_C_MVIB, "MIN_PAUSE_TIME", 2000);
+    nokia_const_int(vm, NJ_C_MVIB, "MAX_VIBRATE_TIME", 0x7FFFFFFF);
+    nokia_const_int(vm, NJ_C_SOUND, "SOUND_UNINITIALIZED", 3);
+    /*
+     * The rest of Nokia's Sound constant block, values from the same
+     * javap -constants run over the 5100 SDK's lib/classes.zip.  A title that
+     * reads one of these and finds no field gets NoSuchFieldError before it
+     * ever asks to play anything.
+     */
+    nokia_const_int(vm, NJ_C_SOUND, "SUCCESSFUL_OPERATION", 15);
+    nokia_const_int(vm, NJ_C_SOUND, "FAIL_OPERATION", 16);
+    nokia_const_int(vm, NJ_C_SOUND, "DEFAULT_VOLUME", -1);
+    nokia_const_int(vm, NJ_C_SOUND, "TONE_VOLUME_NOT_GIVEN", 255);
+    nokia_const_int(vm, NJ_C_SOUND, "FREQUENCY_LOW", 0);
+    nokia_const_int(vm, NJ_C_SOUND, "FREQUENCY_HIGH", 7692);
+    nokia_const_int(vm, NJ_C_SOUND, "MAX_DURATION", 2000);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_BAD_PHONE_STATE", 0);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_BAD_STATE", 1);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_BAD_SEQUENCE", 2);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_PLAY_FAIL", 3);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_OK", 4);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_NOT_READY", 5);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_OUT_OF_MEMORY", 6);
+    nokia_const_int(vm, NJ_C_SOUND, "RET_COULD_NOT_SEND", 7);
+    nokia_const_int(vm, NJ_C_SOUND, "TYPE_BUZZER", 8);
+    nokia_const_int(vm, NJ_C_SOUND, "TYPE_TONE", 9);
+    nokia_const_int(vm, NJ_C_SOUND, "TYPE_ALERT", 10);
+    nokia_const_int(vm, NJ_C_SOUND, "ALERT_ALARM", 0);
+    nokia_const_int(vm, NJ_C_SOUND, "ALERT_CONFIRMATION", 1);
+    nokia_const_int(vm, NJ_C_SOUND, "ALERT_ERROR", 2);
+    nokia_const_int(vm, NJ_C_SOUND, "ALERT_INFO", 3);
+    nokia_const_int(vm, NJ_C_SOUND, "ALERT_WARNING", 4);
+
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "FLIP_HORIZONTAL", 0x2000);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "FLIP_VERTICAL", 0x4000);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "ROTATE_90", 90);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "ROTATE_180", 180);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "ROTATE_270", 270);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_BYTE_1_GRAY", 1);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_BYTE_1_GRAY_VERTICAL", -1);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_BYTE_2_GRAY", 2);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_BYTE_4_GRAY", 4);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_BYTE_8_GRAY", 8);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_BYTE_332_RGB", 332);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_USHORT_4444_ARGB", 4444);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_USHORT_444_RGB", 444);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_USHORT_555_RGB", 555);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_USHORT_565_RGB", 565);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_INT_888_RGB", 888);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_INT_8888_ARGB", 8888);
+    nokia_const_int(vm, NJ_C_DGRAPHICS, "TYPE_USHORT_1555_ARGB", 1555);
+
+    {
+        const char *fc = "com/nokia/mid/ui/FullCanvas";
+        nokia_const_int(vm, fc, "SOFT_KEY_LEFT", -6);
+        nokia_const_int(vm, fc, "SOFT_KEY_MIDDLE", -7);
+        nokia_const_int(vm, fc, "SOFT_KEY_RIGHT", -8);
+        nokia_const_int(vm, fc, "SOFT_KEY1", -6);
+        nokia_const_int(vm, fc, "SOFT_KEY2", -7);
+        nokia_const_int(vm, fc, "SOFT_KEY3", -8);
+        nokia_const_int(vm, fc, "KEY_SOFTKEY1", -6);
+        nokia_const_int(vm, fc, "KEY_SOFTKEY2", -7);
+        nokia_const_int(vm, fc, "KEY_SOFTKEY3", -8);
+    }
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_CONTENT_CHANGE", 0x1);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_OPTIONS_CHANGE", 0x2);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_CARET_MOVE", 0x4);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_TRAVERSE_PREVIOUS", 0x8);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_TRAVERSE_NEXT", 0x10);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_PAINT_REQUEST", 0x20);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_DIRECTION_CHANGE", 0x40);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_INPUT_MODE_CHANGE", 0x80);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_LANGUAGE_CHANGE", 0x100);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_TRAVERSE_OUT_SCROLL_UP",
+                    0x200);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_TRAVERSE_OUT_SCROLL_DOWN",
+                    0x400);
+    nokia_const_int(vm, NJ_C_TELISTENER, "ACTION_SCROLLBAR_CHANGED", 0x800);
+    return NJ_OK;
+}
+
+NJFN(nokia_fsd_init) { return NJ_OK; }
+NJFN(nokia_fsd_getUrl)  { ret->r = NULL; return NJ_OK; }
+NJFN(nokia_fsd_getName) { ret->r = NULL; return NJ_OK; }
+
+NJFN(nokia_vk_hide)     { return NJ_OK; }
+NJFN(nokia_vk_show)     { return NJ_OK; }
+NJFN(nokia_vk_visible)  { ret->i = 0; return NJ_OK; }
+
+/*
+ * com.nokia.mid.sound.Sound.
+ *
+ * Only four members of it are used anywhere in the collected corpus:
+ * getState(), play(int), setGain(int) and stop().  Only those are implemented;
+ * inventing the rest would be inventing behaviour nobody asked for.
+ *
+ * play() sets real, observable state and does NOT synthesise audio.  A Sound is
+ * built from a Nokia tone string or from WAV bytes, and converting either into
+ * portable audio is a job the media module already does for javax.microedition
+ * .media - duplicating it here would give games two audio paths that disagree.
+ * getState() reports what actually happened, which is what a game polling for
+ * "is it still playing" is really asking.
+ */
+static nj_field *snd_field(nj_vm *vm, const char *name)
+{
+    return nj_field_lookup(vm, NJ_C_SOUND, name, "I", 0);
+}
+
+NJFN(nokia_snd_init)
+{
+    nj_field *f = snd_field(vm, "state");
+    if (f) {
+        /* Nokia's own Sound answers SOUND_STOPPED (1) once init() has run,
+         * and its constructor runs init(). */
+        nj_field_write_int(vm, NJ_THIS(args), f, 1);
+    }
+    return NJ_OK;
+}
+
+/*
+ * Tell a registered SoundListener that the state changed.
+ *
+ * The listener is a real Java object held in an instance field, so the
+ * collector sees it.  Nothing calls this unless the state really did change:
+ * a listener fired for no reason makes a game believe something happened.
+ */
+static void snd_notify(nj_vm *vm, nj_ref self, nj_s4 state)
+{
+    nj_field *f = nj_field_lookup(vm, NJ_C_SOUND, "_listener",
+                                  "L" NJ_C_SLISTEN ";", 0);
+    nj_ref l;
+    nj_value a[2];
+
+    if (!f) {
+        return;
+    }
+    l = nj_field_read_ref(vm, self, f);
+    if (!l) {
+        return;
+    }
+    a[0].r = self;
+    a[1].i = state;
+    (void)nj_call(vm, l, NJ_C_SLISTEN, "soundStateChanged",
+                  "(L" NJ_C_SOUND ";I)V", a, NULL);
+}
+
+NJFN(nokia_snd_play)
+{
+    nj_field *f = snd_field(vm, "state");
+    if (f) {
+        nj_field_write_int(vm, NJ_THIS(args), f, 0);   /* SOUND_PLAYING */
+    }
+    snd_notify(vm, NJ_THIS(args), 0);
+    return NJ_OK;
+}
+
+NJFN(nokia_snd_setListener)
+{
+    nj_field *f = nj_field_lookup(vm, NJ_C_SOUND, "_listener",
+                                 "L" NJ_C_SLISTEN ";", 0);
+    if (f) {
+        nj_field_write_ref(vm, NJ_THIS(args), f, NJ_ARG_REF(args, 0));
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_snd_stop)
+{
+    nj_field *f = snd_field(vm, "state");
+    if (f) {
+        nj_field_write_int(vm, NJ_THIS(args), f, 1);   /* SOUND_STOPPED */
+    }
+    snd_notify(vm, NJ_THIS(args), 1);
+    return NJ_OK;
+}
+
+NJFN(nokia_snd_setGain)
+{
+    nj_field *f = snd_field(vm, "gain");
+    if (f) {
+        nj_field_write_int(vm, NJ_THIS(args), f, NJ_ARG_INT(args, 0));
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_snd_getState)
+{
+    nj_field *f = snd_field(vm, "state");
+    ret->i = f ? nj_field_read_int(vm, NJ_THIS(args), f) : 0;
+    return NJ_OK;
+}
+
+/*
+ * resume(): carry on with a sound that is not playing.  This runtime has no
+ * paused state of its own - play() is what the port's audio path answers to -
+ * so a sound that is not playing is started again, which is what a game that
+ * calls resume() is asking for.
+ */
+NJFN(nokia_snd_resume)
+{
+    nj_field *f = snd_field(vm, "state");
+    nj_s4 st = f ? nj_field_read_int(vm, NJ_THIS(args), f) : 0;
+
+    if (st == 0) {                  /* SOUND_PLAYING */
+        return NJ_OK;
+    }
+    if (f) {
+        nj_field_write_int(vm, NJ_THIS(args), f, 0);   /* SOUND_PLAYING */
+    }
+    snd_notify(vm, NJ_THIS(args), 0);
+    return NJ_OK;
+}
+
+NJFN(nokia_snd_getGain)
+{
+    nj_field *f = snd_field(vm, "gain");
+    ret->i = f ? nj_field_read_int(vm, NJ_THIS(args), f) : 0;
+    return NJ_OK;
+}
+
+/*
+ * getConcurrentSoundCount(int format): how many sounds of that format can play
+ * at once.  The port's audio hook is a single mixer, so the honest answer is
+ * one - a game reads this to decide whether the music has to stop before a
+ * sound effect.
+ */
+NJFN(nokia_snd_concurrent)
+{
+    (void)args;
+    ret->i = 1;
+    return NJ_OK;
+}
+
+/*
+ * convertFreqToNote(): the Nokia helper that maps a tone frequency onto a MIDI
+ * note number, n = round(12 * log2(f / 8.176)) clamped at zero.  8.176 Hz is
+ * MIDI note 0, so the constant 12 / ln 2 is 17.31234; frequencies at or below
+ * zero have no note and answer 0, matching the reference implementation's
+ * Math.max(..., 0).  Real titles use it to turn an entered frequency into the
+ * tone the player then plays.
+ */
+NJFN(nokia_snd_freq_to_note)
+{
+    nj_s4 freq = NJ_ARG_INT(args, 0);
+    double n;
+
+    ret->i = 0;
+    if (freq <= 0) {
+        return NJ_OK;
+    }
+    n = log((double)freq / 8.176) * 17.31234;
+    ret->i = (nj_s4)(n > 0.0 ? (nj_s4)(n + 0.5) : 0);
+    return NJ_OK;
+}
+
+/*
+ * getSupportedFormats(): the Nokia format constants init() accepts.
+ * FORMAT_TONE (1) and FORMAT_WAV (5) are both real here - the port has a tone
+ * path and a PCM path - so both are advertised.
+ */
+NJFN(nokia_snd_formats)
+{
+    nj_ref a = nj_int_array_new(vm, 2u);
+    nj_s4 *p;
+
+    if (!a) {
+        return nj_throw_oom(vm);
+    }
+    p = (nj_s4 *)a->u.bytes;
+    if (p) {
+        p[0] = 1;                   /* FORMAT_TONE */
+        p[1] = 5;                   /* FORMAT_WAV  */
+    }
+    ret->r = a;
+    return NJ_OK;
+}
+
+#define M(name, desc, flags) { name, desc, flags }
+
+static const nj_builtin_method mplisten_methods[] = {
+    M("pointersChanged", "([I)V", NJ_ACC_ABSTRACT)
+};
+
+static const nj_builtin_method slisten_methods[] = {
+    M("soundStateChanged", "(L" NJ_C_SOUND ";I)V", NJ_ACC_ABSTRACT)
+};
+
+static const nj_builtin_field mptouch_fields[] = {
+    { "_nj_listener", "L" NJ_C_MPLISTEN ";", 0 },
+    { "_nj_state",    "[I", 0 },
+    { "_nj_x",        "[I", 0 },
+    { "_nj_y",        "[I", 0 },
+    { "_nj_instance", "L" NJ_C_MPTOUCH ";", NJ_ACC_STATIC },
+    { "POINTER_PRESSED",  "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "POINTER_DRAGGED",  "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "POINTER_RELEASED", "I", NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_method mptouch_methods[] = {
+    M("<init>", "()V", 0),
+    /* The Asha generation: a singleton and per-pointer static readers. */
+    M("getInstance", "()L" NJ_C_MPTOUCH ";", NJ_ACC_STATIC),
+    M("addMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";)V", 0),
+    M("removeMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";)V", 0),
+    M("getState", "(I)I", NJ_ACC_STATIC),
+    M("getX",     "(I)I", NJ_ACC_STATIC),
+    M("getY",     "(I)I", NJ_ACC_STATIC),
+    /* The Series 40 generation, kept because titles still call it. */
+    M("setMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";)V", NJ_ACC_STATIC),
+    M("setMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";I)V", NJ_ACC_STATIC)
+};
+
+static const nj_builtin_field sound_fields[] = {
+    { "state", "I", 0 },
+    { "gain",  "I", 0 },
+    { "_listener", "L" NJ_C_SLISTEN ";", 0 },
+    { "FORMAT_TONE",   "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FORMAT_WAV",    "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOUND_STOPPED", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOUND_PLAYING", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOUND_UNPLAYABLE", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOUND_UNINITIALIZED", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SUCCESSFUL_OPERATION", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FAIL_OPERATION", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "DEFAULT_VOLUME", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TONE_VOLUME_NOT_GIVEN", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FREQUENCY_LOW", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FREQUENCY_HIGH", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MAX_DURATION", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_BAD_PHONE_STATE", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_BAD_STATE", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_BAD_SEQUENCE", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_PLAY_FAIL", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_OK", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_NOT_READY", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_OUT_OF_MEMORY", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "RET_COULD_NOT_SEND", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BUZZER", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_TONE", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_ALERT", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ALERT_ALARM", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ALERT_CONFIRMATION", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ALERT_ERROR", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ALERT_INFO", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ALERT_WARNING", "I", NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_method sound_methods[] = {
+    M("<init>",        "(IJ)V", 0),
+    M("<init>",        "([BI)V", 0),
+    /*
+     * The same two payloads are also reachable as a plain init() method, and
+     * 3D滚球_11586 calls it that way.  Declaring only the constructors made
+     * the class exist and the call fail, which is the worst of both.
+     */
+    M("init",          "(IJ)V", 0),
+    M("init",          "([BI)V", 0),
+    M("play",          "(I)V",  0),
+    M("stop",          "()V",   0),
+    M("setGain",       "(I)V",  0),
+    M("getState",      "()I",   0),
+    M("resume",       "()V",   0),
+    M("getGain",      "()I",   0),
+    M("getConcurrentSoundCount", "(I)I", NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("getSupportedFormats", "()[I", NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("convertFreqToNote", "(I)I", NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    /* Only one game in the corpus calls this, and it implements the
+     * listener itself: the interface has to exist or that class cannot
+     * even be loaded. */
+    M("setSoundListener", "(L" NJ_C_SLISTEN ";)V", 0),
+    M("release",       "()V",   0)
+};
+
+static const nj_builtin_field fsdetail_fields[] = {
+    { "url",      "Ljava/lang/String;", 0 },
+    { "name",     "Ljava/lang/String;", 0 },
+    { "mimeType", "Ljava/lang/String;", 0 },
+    { "size",     "J",                  0 }
+};
+
+/*
+ * The constants.  A builtin class has no ConstantValue attribute, so a static
+ * final has to be given its value when the VM comes up - and until it is, the
+ * field EXISTS and reads 0, which is worse than absent: a MIDlet compiles,
+ * runs, and silently compares against zero.
+ *
+ * These are declared and set here rather than in the stubs alone because
+ * tools/test_consts.c compares every constant the stubs promise against what
+ * the runtime actually holds, and it found ten of these missing.
+ */
+static const nj_builtin_field fselect_fields[] = {
+    { "FILE_SYSTEM_PHONE",     "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FILE_SYSTEM_MMC",       "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FILE_SYSTEM_ALL",       "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MEDIA_TYPE_IMAGE",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MEDIA_TYPE_VIDEO",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MEDIA_TYPE_AUDIO",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MEDIA_TYPE_APPLICATION","I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MEDIA_TYPE_ALL",        "I", NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_field fullcanvas_fields[] = {
+    { "SOFT_KEY_LEFT",   "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOFT_KEY_MIDDLE", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOFT_KEY_RIGHT",  "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOFT_KEY1",       "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOFT_KEY2",       "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "SOFT_KEY3",       "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "KEY_SOFTKEY1",    "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "KEY_SOFTKEY2",    "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "KEY_SOFTKEY3",    "I", NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_method fselect_methods[] = {
+    M("launch", "(IIZ)[L" NJ_C_FSDETAIL ";", NJ_ACC_STATIC)
+};
+
+static const nj_builtin_method fsdetail_methods[] = {
+    M("<init>",    "()V", 0),
+    M("getUrl",    "()Ljava/lang/String;", 0),
+    M("getName",   "()Ljava/lang/String;", 0)
+};
+
+static const nj_builtin_method vkeyboard_methods[] = {
+    M("hideOpenKeypadCommand", "(Z)V", NJ_ACC_STATIC),
+    M("showOpenKeypadCommand", "(Z)V", NJ_ACC_STATIC),
+    M("setVisibility",         "(Z)V", NJ_ACC_STATIC),
+    M("getVisibility",         "()Z",  NJ_ACC_STATIC)
+};
+
+/* com.nokia.mid.ui.DirectUtils ------------------------------------------ */
+
+/* The public-API image type, spelled once. */
+#define NJ_DU_IMAGE_CLS "javax/microedition/lcdui/Image"
+#define NJ_DU_IMAGE_DESC "Ljavax/microedition/lcdui/Image;"
+
+/* The MIDP image helpers temporarily root both the Image and its int[].
+ * Reserve those slots before allocation: nj_root itself cannot report OOM.
+ * The dummy roots are released immediately, retaining the table capacity. */
+static nj_status nokia_du_reserve_image_roots(nj_vm *vm)
+{
+    nj_u4 mark = nj_root_mark(vm), i;
+    for (i = 0; i < 2u; ++i) {
+        nj_root(vm, NULL);
+        if (nj_root_mark(vm) != mark + i + 1u) {
+            nj_root_release(vm, mark);
+            return nj_throw(vm, "java/lang/OutOfMemoryError", NULL);
+        }
+    }
+    nj_root_release(vm, mark);
+    return NJ_OK;
+}
+
+/* Initialization copies all ARGB bits, including zero-alpha RGB. Painting
+ * through Graphics.setColor would discard alpha and force opaque pixels. */
+NJFN(nokia_du_createImage3)
+{
+    int w = NJ_ARG_INT(args, 0), h = NJ_ARG_INT(args, 1);
+    nj_u4 color = (nj_u4)NJ_ARG_INT(args, 2), *pixels;
+    nj_size i, count;
+    nj_ref img;
+    nj_field *mut;
+
+    if (w <= 0 || h <= 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "image dimensions must be positive");
+    }
+    mut = nj_field_lookup(vm, NJ_DU_IMAGE_CLS, NJ_F_IMG_MUTABLE, "Z", 0);
+    if (!mut || nokia_du_reserve_image_roots(vm) != NJ_OK) {
+        return NJ_ERR;
+    }
+    /* Skip MIDP's white initialization; every pixel is replaced below. */
+    img = nj_midp_image_new(vm, w, h, 0);
+    if (!img) {
+        return NJ_ERR;
+    }
+    /* No Java allocation between returning the image and filling its store. */
+    pixels = nj_midp_image_pixels(vm, img);
+    count = (nj_size)w * (nj_size)h; /* image helper validated the extent */
+    for (i = 0; i < count; ++i) {
+        pixels[i] = color;
+    }
+    nj_field_write_int(vm, img, mut, 1);
+    ret->r = img;
+    return NJ_OK;
+}
+
+NJFN(nokia_du_createImage2)
+{
+    nj_value a[2];
+
+    /* Retain this extension's MIDP white fill and dimension exceptions. */
+    if (NJ_ARG_INT(args, 0) <= 0 || NJ_ARG_INT(args, 1) <= 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "image dimensions must be positive");
+    }
+    if (nokia_du_reserve_image_roots(vm) != NJ_OK) {
+        return NJ_ERR;
+    }
+    a[0] = args[0];
+    a[1] = args[1];
+    ret->r = nj_call_ref(vm, NULL, NJ_DU_IMAGE_CLS, "createImage",
+                         "(II)" NJ_DU_IMAGE_DESC, a);
+    return ret->r ? NJ_OK : NJ_ERR;
+}
+
+/* Reuse MIDP decoding and its pixel store, but Nokia promises a mutable result.
+ * Validate the slice without signed offset+length overflow before delegating. */
+NJFN(nokia_du_createImage)
+{
+    nj_ref data = NJ_ARG_REF(args, 0), img;
+    nj_s4 off = NJ_ARG_INT(args, 1), len = NJ_ARG_INT(args, 2);
+    nj_field *mut;
+
+    if (!data) {
+        return nj_throw(vm, "java/lang/NullPointerException", "data is null");
+    }
+    if (off < 0 || len < 0 || (nj_u4)off > nj_array_length(data) ||
+        (nj_u4)len > nj_array_length(data) - (nj_u4)off) {
+        return nj_throw(vm, "java/lang/ArrayIndexOutOfBoundsException", NULL);
+    }
+    if (len == 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException", "no image data");
+    }
+    mut = nj_field_lookup(vm, NJ_DU_IMAGE_CLS, NJ_F_IMG_MUTABLE, "Z", 0);
+    if (!mut) {
+        return NJ_ERR;
+    }
+    if (nokia_du_reserve_image_roots(vm) != NJ_OK) {
+        return NJ_ERR;
+    }
+    img = nj_call_ref(vm, NULL, NJ_DU_IMAGE_CLS, "createImage",
+                      "([BII)" NJ_DU_IMAGE_DESC, args);
+    if (!img) {
+        nj_class *io = nj_class_find(vm, "java/io/IOException");
+        if (vm->exception && io &&
+            nj_class_is_assignable(vm->exception->cls, io)) {
+            nj_clear_exception(vm);
+            return nj_throw(vm, "java/lang/IllegalArgumentException",
+                            "cannot decode image");
+        }
+        return NJ_ERR;
+    }
+    /* A field write cannot collect; no extra image or pixel copy is needed. */
+    nj_field_write_int(vm, img, mut, 1);
+    ret->r = img;
+    return NJ_OK;
+}
+
+/*
+ * getDirectGraphics(Graphics) returns that same Graphics - see the note above
+ * the interface table for why that is the whole implementation.
+ */
+NJFN(nokia_du_getDirectGraphics)
+{
+    ret->r = NJ_ARG_REF(args, 0);
+    return NJ_OK;
+}
+
+/*
+ * com.nokia.mid.ui.DirectUtils and DirectGraphics.
+ *
+ * DirectGraphics is an INTERFACE on the phone; twelve of the titles collected
+ * under tests/games ask for it, nearly all of them for createImage(w, h, argb)
+ * - a screen-sized image of one colour, which the standard API can only build
+ * by allocating and then filling through a Graphics.
+ *
+ * getDirectGraphics() hands back the Graphics it was given.  That is not a
+ * shortcut: invokeinterface dispatches on the receiver's RUNTIME class, and
+ * the seven DirectGraphics methods are declared on javax.microedition.lcdui.
+ * Graphics in nj_lib_lcdui.c, which is the file that can reach the nj_gfx
+ * primitives.  So the object a caller gets back must BE a Graphics, and it is.
+ */
+static const nj_builtin_field dgraphics_fields[] = {
+    { "FLIP_HORIZONTAL", "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FLIP_VERTICAL",   "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ROTATE_90",       "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ROTATE_180",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ROTATE_270",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BYTE_1_GRAY",           "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BYTE_1_GRAY_VERTICAL",  "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BYTE_2_GRAY",           "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BYTE_4_GRAY",           "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BYTE_8_GRAY",           "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_BYTE_332_RGB",          "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_USHORT_4444_ARGB",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_USHORT_444_RGB",        "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_USHORT_555_RGB",        "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_USHORT_565_RGB",        "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_INT_888_RGB",           "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_INT_8888_ARGB",         "I", NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "TYPE_USHORT_1555_ARGB",      "I", NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_method dgraphics_methods[] = {
+    M("setARGBColor",         "(I)V",   NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getNativePixelFormat", "()I",    NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawImage",  "(L" NJ_C_IMAGE ";IIII)V", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("fillTriangle", "(IIIIIII)V",     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawTriangle", "(IIIIIII)V",     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawPolygon", "([II[IIII)V",     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("fillPolygon", "([II[IIII)V",     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawPixels",  "([SZIIIIIIII)V",  NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getPixels",   "([SIIIIIII)V",    NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getPixels", "([IIIIIIII)V", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawImage",   "([IIII)V",        NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawPixels",  "([IZIIIIIIII)V",  NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("drawPixels",  "([B[BIIIIIIII)V", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getPixels",   "([B[BIIIIIII)V",  NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getAlphaComponent", "()I",       NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT)
+};
+
+static const nj_builtin_method dutils_methods[] = {
+    M("createImage", "(II)Ljavax/microedition/lcdui/Image;", NJ_ACC_STATIC),
+    M("createImage", "(III)Ljavax/microedition/lcdui/Image;", NJ_ACC_STATIC),
+    M("createImage", "([BII)Ljavax/microedition/lcdui/Image;", NJ_ACC_STATIC),
+    M("getDirectGraphics",
+      "(Ljavax/microedition/lcdui/Graphics;)L" NJ_C_DGRAPHICS ";",
+      NJ_ACC_STATIC)
+};
+
+/*
+ * com.nokia.mid.ui.DeviceControl
+ *
+ * Vibration, the notification lights and the screen backlight have no
+ * equivalent in MIDP, so a MIDlet that wants any of them has no portable way
+ * to ask.  Three titles collected here call into this class, and on a device
+ * it is four side effects with nothing to observe afterwards.
+ *
+ * Vibration now has a port hook (nj_port.vibrate); lights and the backlight do
+ * not, so those stay successful no-ops.  That is a deliberate choice over
+ * throwing: a game that vibrates on a hit is playable without the buzz, and
+ * refusing the call would take the whole game down for a missing motor.
+ */
+static const nj_builtin_method devctl_methods[] = {
+    M("setLights",       "(II)V",  NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("setLights",       "(III)V", NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("flashLights",     "(I)V",   NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("vibrate",         "(I)V",   NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("startVibra",      "(IJ)V",  NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("stopVibra",       "()V",    NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("flashLights",     "(J)V",   NJ_ACC_STATIC | NJ_ACC_PUBLIC),
+    M("setScreenState",  "(Z)V",   NJ_ACC_STATIC | NJ_ACC_PUBLIC)
+};
+
+NJFN(nokia_dc_ok)
+{
+    (void)vm;
+    (void)args;
+    (void)ret;
+    return NJ_OK;
+}
+
+/*
+ * vibrate(duration) is the short form of startVibra(); like it, it forwards to
+ * the port hook when the port has one and validates a negative duration the
+ * way the Nokia reference does.
+ */
+NJFN(nokia_dc_vibrate)
+{
+    nj_s4 ms = NJ_ARG_INT(args, 0);
+
+    if (ms < 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "negative duration");
+    }
+    if (vm->port && vm->port->vibrate) {
+        vm->port->vibrate(vm->port->ud, (int)ms);
+    }
+    return NJ_OK;
+}
+
+/*
+ * startVibra(frequency, duration) / stopVibra(): the Nokia UI API's second
+ * shape for the side effect vibrate() performs.  The frequency argument has no
+ * meaning for a port whose hook takes milliseconds, so it is ignored, and
+ * stopVibra() is a zero-length buzz.  The light calls stay no-ops for the
+ * reason above the table: a game that flashes on a hit is playable without the
+ * light, and refusing the call would take the whole game down for a missing
+ * lamp.
+ */
+NJFN(nokia_dc_startVibra)
+{
+    nj_s4 ms = NJ_ARG_INT(args, 1);
+
+    if (ms < 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "negative duration");
+    }
+    if (vm->port && vm->port->vibrate) {
+        vm->port->vibrate(vm->port->ud, (int)ms);
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_dc_stopVibra)
+{
+    (void)args;
+    if (vm->port && vm->port->vibrate) {
+        vm->port->vibrate(vm->port->ud, 0);
+    }
+    return NJ_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Vendor vibration APIs                                              */
+/*                                                                    */
+/* Samsung's Vibration and Motorola's Vibrator are handset extras that */
+/* titles probe with Class.forName() before using.  Neither can buzz a */
+/* headless port, so the implementations validate their arguments the  */
+/* way the reference does and otherwise do nothing: the title gets the  */
+/* methods it probed for, and no state is kept (so RAM does not grow).  */
+/* ------------------------------------------------------------------ */
+static nj_status svib_is_supported(nj_vm *vm, nj_thread *th,
+                                   nj_value *args, nj_value *ret)
+{
+    (void)vm; (void)th; (void)args;
+    ret->i = 1;
+    return NJ_OK;
+}
+
+static nj_status svib_start(nj_vm *vm, nj_thread *th, nj_value *args,
+                            nj_value *ret)
+{
+    nj_s4 duration = NJ_ARG_INT(args, 0);
+    nj_s4 strength = NJ_ARG_INT(args, 1);
+
+    (void)th; (void)ret;
+    /* Reference: duration may be zero, strength is a 1..5 scale. */
+    if (duration < 0 || strength < 1 || strength > 5) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "invalid vibration arguments");
+    }
+    return NJ_OK;
+}
+
+static nj_status svib_stop(nj_vm *vm, nj_thread *th, nj_value *args,
+                           nj_value *ret)
+{
+    (void)vm; (void)th; (void)args; (void)ret;
+    return NJ_OK;
+}
+
+static nj_status mvib_set_tone(nj_vm *vm, nj_thread *th, nj_value *args,
+                               nj_value *ret)
+{
+    nj_s4 tone = NJ_ARG_INT(args, 0);
+
+    (void)th; (void)ret;
+    if (tone < 0 || tone > 5) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "unknown vibration tone");
+    }
+    return NJ_OK;
+}
+
+static nj_status mvib_periodic_one(nj_vm *vm, nj_thread *th, nj_value *args,
+                                   nj_value *ret)
+{
+    (void)vm; (void)th; (void)ret;
+    if (NJ_ARG_INT(args, 0) < 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "negative vibration time");
+    }
+    return NJ_OK;
+}
+
+static nj_status mvib_periodic_two(nj_vm *vm, nj_thread *th, nj_value *args,
+                                   nj_value *ret)
+{
+    (void)th; (void)ret;
+    if (NJ_ARG_INT(args, 0) < 0 || NJ_ARG_INT(args, 1) < 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "negative vibration time");
+    }
+    return NJ_OK;
+}
+
+static nj_status mvib_setup(nj_vm *vm, nj_thread *th, nj_value *args,
+                            nj_value *ret)
+{
+    (void)th; (void)ret;
+    if (NJ_ARG_INT(args, 0) < 0 || NJ_ARG_INT(args, 1) < 0 ||
+        NJ_ARG_INT(args, 2) < 0) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "negative vibration time");
+    }
+    return NJ_OK;
+}
+
+static nj_status mvib_noop(nj_vm *vm, nj_thread *th, nj_value *args,
+                           nj_value *ret)
+{
+    (void)vm; (void)th; (void)args; (void)ret;
+    return NJ_OK;
+}
+
+static const nj_builtin_field mvib_fields[] = {
+    { "MAX_VIBRATE_TIME", "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "MIN_PAUSE_TIME",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "VIBRATE_2SHORT",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "VIBRATE_LONG",     "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "VIBRATE_PULSE",    "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "VIBRATE_SHORT",    "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "VIBRATE_SHORT_LONG","I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "VIBRATE_SILENT",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_method svib_methods[] = {
+    M("isSupported", "()Z",   NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("start",       "(II)V", NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("stop",        "()V",   NJ_ACC_PUBLIC | NJ_ACC_STATIC)
+};
+
+static const nj_builtin_method mvib_methods[] = {
+    M("run",                    "()V",    NJ_ACC_PUBLIC),
+    M("setVibrateTone",         "(I)V",   NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("vibrateFor",             "(I)V",   NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("vibratePeriodically",    "(I)V",   NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("vibratePeriodically",    "(II)V",  NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("vibratorOff",            "()V",    NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("vibratorOn",             "()V",    NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("setupVibration",         "(III)V", NJ_ACC_PUBLIC | NJ_ACC_STATIC)
+};
+
+/* ------------------------------------------------------------------ *
+ * Round 154: the last small Nokia UI families (Clipboard, global
+ * indicators, tactile feedback, soft notifications, gestures, joystick
+ * events and the DirectGraphicsImplemented marker).  KEmulator ships the
+ * same surface; where it is a desktop stub (AWT clipboard, indicators
+ * always 0) this file keeps spec behaviour on top of per-VM Java state,
+ * and documents where the hardware simply does not exist (tactile
+ * feedback, gesture and joystick events never fire).
+ * ------------------------------------------------------------------ */
+static const nj_builtin_field clipboard_fields[] = {
+    { "cbText", "Ljava/lang/String;", NJ_ACC_PRIVATE | NJ_ACC_STATIC }
+};
+static const nj_builtin_method clipboard_methods[] = {
+    M("copyToClipboard",   "(Ljava/lang/String;)V", NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("copyFromClipboard", "()Ljava/lang/String;",  NJ_ACC_PUBLIC | NJ_ACC_STATIC)
+};
+
+static const nj_builtin_field globind_fields[] = {
+    { "MAIL_INDICATOR",          "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "CHAT_INDICATOR",          "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "INDICATOR_UNINITIALIZED", "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "INDICATOR_HIDE",          "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "INDICATOR_SHOW",          "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "giMail", "I", NJ_ACC_PRIVATE | NJ_ACC_STATIC },
+    { "giChat", "I", NJ_ACC_PRIVATE | NJ_ACC_STATIC }
+};
+static const nj_builtin_method globind_methods[] = {
+    M("setGlobalIndicator", "(II)I", NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("getGlobalIndicator", "(I)I",  NJ_ACC_PUBLIC | NJ_ACC_STATIC)
+};
+
+static const nj_builtin_field globindexc_fields[] = {
+    { "geCode", "I", NJ_ACC_PRIVATE }
+};
+static const nj_builtin_method globindexc_methods[] = {
+    M("<init>",         "()V",                NJ_ACC_PUBLIC),
+    M("<init>",         "(Ljava/lang/String;)V", NJ_ACC_PUBLIC),
+    M("<init>",         "(Ljava/lang/String;I)V", NJ_ACC_PUBLIC),
+    M("getErrorCode",   "()I",                NJ_ACC_PUBLIC)
+};
+
+static const nj_builtin_field tactile_fields[] = {
+    { "FEEDBACK_STYLE_BASIC",     "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "FEEDBACK_STYLE_SENSITIVE", "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+static const nj_builtin_method tactile_methods[] = {
+    M("<init>",                       "()V",           NJ_ACC_PUBLIC),
+    M("directFeedback",               "(I)V",          NJ_ACC_PUBLIC),
+    M("isTouchFeedbackSupported",     "()Z",           NJ_ACC_PUBLIC),
+    M("registerFeedbackArea",         "(Ljava/lang/Object;IIIIII)V", NJ_ACC_PUBLIC),
+    M("unregisterFeedbackArea",       "(Ljava/lang/Object;I)V",      NJ_ACC_PUBLIC),
+    M("removeFeedbackForComponent",   "(Ljava/lang/Object;)V",       NJ_ACC_PUBLIC),
+    M("moveFeedbackAreaToFirstPriority", "(Ljava/lang/Object;I)V",   NJ_ACC_PUBLIC)
+};
+
+static const nj_builtin_method softnotif_methods[] = {
+    M("newInstance",          "(I)L" NJ_C_SOFTNOTIF ";", NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("newInstance",          "()L" NJ_C_SOFTNOTIF ";",  NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("getId",                "()I",                     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("post",                 "()V",                     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("remove",               "()V",                     NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("setListener",          "(L" NJ_C_SNLISTEN ";)V",  NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("setText",              "(Ljava/lang/String;Ljava/lang/String;)V",
+                                                          NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("setSoftkeyLabels",     "(Ljava/lang/String;Ljava/lang/String;)V",
+                                                          NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("setImage",             "([B)V",                   NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT)
+};
+
+static const nj_builtin_field snimpl_fields[] = {
+    { "snId",   "I",                    NJ_ACC_PRIVATE },
+    { "snTitle","Ljava/lang/String;",   NJ_ACC_PRIVATE },
+    { "snBody", "Ljava/lang/String;",   NJ_ACC_PRIVATE },
+    { "snLeft", "Ljava/lang/String;",   NJ_ACC_PRIVATE },
+    { "snRight","Ljava/lang/String;",   NJ_ACC_PRIVATE },
+    { "snImg",  "[B",                   NJ_ACC_PRIVATE },
+    { "snList", "L" NJ_C_SNLISTEN ";",  NJ_ACC_PRIVATE }
+};
+static const nj_builtin_method snimpl_methods[] = {
+    M("<init>",            "()V",   NJ_ACC_PUBLIC),
+    M("<init>",            "(I)V",  NJ_ACC_PUBLIC),
+    M("getId",             "()I",   NJ_ACC_PUBLIC),
+    M("post",              "()V",   NJ_ACC_PUBLIC),
+    M("remove",            "()V",   NJ_ACC_PUBLIC),
+    M("setListener",       "(L" NJ_C_SNLISTEN ";)V", NJ_ACC_PUBLIC),
+    M("setText",           "(Ljava/lang/String;Ljava/lang/String;)V", NJ_ACC_PUBLIC),
+    M("setSoftkeyLabels",  "(Ljava/lang/String;Ljava/lang/String;)V", NJ_ACC_PUBLIC),
+    M("setImage",          "([B)V", NJ_ACC_PUBLIC)
+};
+
+static const nj_builtin_field snexc_fields[] = {
+    { "seCode", "I", NJ_ACC_PRIVATE }
+};
+static const nj_builtin_method snexc_methods[] = {
+    M("<init>",       "()V",                    NJ_ACC_PUBLIC),
+    M("<init>",       "(Ljava/lang/String;)V",  NJ_ACC_PUBLIC),
+    M("<init>",       "(Ljava/lang/String;I)V", NJ_ACC_PUBLIC),
+    M("getErrorCode", "()I",                    NJ_ACC_PUBLIC)
+};
+
+static const nj_builtin_method snlisten_methods[] = {
+    M("notificationSelected",  "(L" NJ_C_SOFTNOTIF ";)V",
+       NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("notificationDismissed", "(L" NJ_C_SOFTNOTIF ";)V",
+       NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT)
+};
+
+static const nj_builtin_method joylisten_methods[] = {
+    M("joystickEvent", "(II)V", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT)
+};
+
+static const nj_builtin_field gestzone_fields[] = {
+    { "GESTURE_TAP",           "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "GESTURE_LONG_PRESS",    "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "GESTURE_LONG_PRESS_REP","I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "GESTURE_DRAG",          "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "GESTURE_FLICK",         "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "GESTURE_PINCH",         "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "GESTURE_DOUBLE_TAP",    "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "gzType",                "I", NJ_ACC_PRIVATE }
+};
+static const nj_builtin_method gestzone_methods[] = {
+    M("<init>",  "(I)V", NJ_ACC_PUBLIC),
+    M("getType", "()I",  NJ_ACC_PUBLIC)
+};
+static const nj_builtin_method gestevent_methods[] = {
+    M("getType",          "()I", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getStartX",        "()I", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getStartY",        "()I", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT),
+    M("getFlickDirection","()F", NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT)
+};
+static const nj_builtin_method gestmgr_methods[] = {
+    M("register",    "(Ljava/lang/Object;L" NJ_C_GESTZONE ";)Z",
+       NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("setListener", "(Ljava/lang/Object;L" NJ_C_GESTLISTEN ";)V",
+       NJ_ACC_PUBLIC | NJ_ACC_STATIC)
+};
+
+NJFN(nokia_clip_copy)
+{
+    nj_field *f = NJ_FS(vm, NJ_C_CLIPBOARD, "cbText", "Ljava/lang/String;");
+    nj_ref text = NJ_ARG_REF(args, 0);
+    if (f) {
+        nj_field_write_ref(vm, NULL, f, text);
+    }
+    return NJ_OK;
+}
+NJFN(nokia_clip_paste)
+{
+    nj_field *f = NJ_FS(vm, NJ_C_CLIPBOARD, "cbText", "Ljava/lang/String;");
+    ret->r = f ? nj_field_read_ref(vm, NULL, f) : 0;
+    return NJ_OK;
+}
+
+static nj_field *globind_field(nj_vm *vm, nj_s4 indicator)
+{
+    if (indicator == 274) {
+        return NJ_FS(vm, NJ_C_GLOBIND, "giMail", "I");
+    }
+    if (indicator == 260) {
+        return NJ_FS(vm, NJ_C_GLOBIND, "giChat", "I");
+    }
+    return NULL;
+}
+NJFN(nokia_globind_set)
+{
+    nj_s4 indicator = NJ_ARG_INT(args, 0);
+    nj_s4 value = NJ_ARG_INT(args, 1);
+    nj_field *f = globind_field(vm, indicator);
+    nj_s4 old;
+    if (!f) {
+        return nj_throw(vm, NJ_C_GLOBINDEXC, "unknown global indicator");
+    }
+    if (value != 0 && value != 1 && value != 2) {
+        return nj_throw(vm, NJ_C_GLOBINDEXC, "unknown indicator value");
+    }
+    old = nj_iget(vm, NULL, f);
+    nj_iput(vm, NULL, f, value);
+    ret->i = old;
+    return NJ_OK;
+}
+NJFN(nokia_globind_get)
+{
+    nj_field *f = globind_field(vm, NJ_ARG_INT(args, 0));
+    if (!f) {
+        return nj_throw(vm, NJ_C_GLOBINDEXC, "unknown global indicator");
+    }
+    ret->i = nj_iget(vm, NULL, f);
+    return NJ_OK;
+}
+NJFN(nokia_gex_init0) { return NJ_OK; }
+NJFN(nokia_gex_init_msg) { return NJ_OK; }
+NJFN(nokia_gex_init_msg_code)
+{
+    nj_field *f = NJ_F(vm, NJ_C_GLOBINDEXC, "geCode", "I");
+    if (f) {
+        nj_iput(vm, NJ_THIS(args), f, NJ_ARG_INT(args, 1));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_gex_code)
+{
+    nj_field *f = NJ_F(vm, NJ_C_GLOBINDEXC, "geCode", "I");
+    ret->i = f ? nj_iget(vm, NJ_THIS(args), f) : 0;
+    return NJ_OK;
+}
+
+NJFN(nokia_tactile_init) { return NJ_OK; }
+NJFN(nokia_tactile_direct)
+{
+    nj_s4 style = NJ_ARG_INT(args, 0);
+    if (style != 1 && style != 2) {
+        return nj_throw(vm, "java/lang/IllegalArgumentException",
+                        "unknown tactile feedback style");
+    }
+    return NJ_OK;
+}
+NJFN(nokia_tactile_supported)
+{
+    ret->i = 0;     /* no haptics on the emulated device */
+    return NJ_OK;
+}
+NJFN(nokia_tactile_register)   { return NJ_OK; }
+NJFN(nokia_tactile_unregister) { return NJ_OK; }
+NJFN(nokia_tactile_remove)     { return NJ_OK; }
+NJFN(nokia_tactile_move)       { return NJ_OK; }
+
+NJFN(nokia_snex_init0) { return NJ_OK; }
+NJFN(nokia_snex_init_msg) { return NJ_OK; }
+NJFN(nokia_snex_init_msg_code)
+{
+    nj_field *f = NJ_F(vm, NJ_C_SNEXC, "seCode", "I");
+    if (f) {
+        nj_iput(vm, NJ_THIS(args), f, NJ_ARG_INT(args, 1));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_snex_code)
+{
+    nj_field *f = NJ_F(vm, NJ_C_SNEXC, "seCode", "I");
+    ret->i = f ? nj_iget(vm, NJ_THIS(args), f) : 0;
+    return NJ_OK;
+}
+
+static nj_ref snimpl_new(nj_vm *vm, nj_s4 id)
+{
+    nj_ref inst = nj_object_new(vm, NJ_C_SNIMPL);
+    nj_value a[1];
+    if (!inst) {
+        return 0;
+    }
+    a[0].i = id;
+    if (nj_call_special(vm, inst, NJ_C_SNIMPL, "<init>", "(I)V", a, NULL) != NJ_OK) {
+        return 0;
+    }
+    return inst;
+}
+NJFN(nokia_sn_new1) { ret->r = snimpl_new(vm, NJ_ARG_INT(args, 0)); return NJ_OK; }
+NJFN(nokia_sn_new0) { ret->r = snimpl_new(vm, 0); return NJ_OK; }
+
+NJFN(nokia_sn_init0) { return NJ_OK; }
+NJFN(nokia_sn_init1)
+{
+    nj_field *f = NJ_F(vm, NJ_C_SNIMPL, "snId", "I");
+    if (f) {
+        nj_iput(vm, NJ_THIS(args), f, NJ_ARG_INT(args, 0));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_sn_getid)
+{
+    nj_field *f = NJ_F(vm, NJ_C_SNIMPL, "snId", "I");
+    ret->i = f ? nj_iget(vm, NJ_THIS(args), f) : 0;
+    return NJ_OK;
+}
+NJFN(nokia_sn_post)   { return NJ_OK; }     /* no system notification centre */
+NJFN(nokia_sn_remove) { return NJ_OK; }
+NJFN(nokia_sn_setlistener)
+{
+    nj_field *f = NJ_F(vm, NJ_C_SNIMPL, "snList", "L" NJ_C_SNLISTEN ";");
+    if (f) {
+        nj_field_write_ref(vm, NJ_THIS(args), f, NJ_ARG_REF(args, 0));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_sn_settext)
+{
+    nj_field *t = NJ_F(vm, NJ_C_SNIMPL, "snTitle", "Ljava/lang/String;");
+    nj_field *b = NJ_F(vm, NJ_C_SNIMPL, "snBody", "Ljava/lang/String;");
+    if (t) {
+        nj_field_write_ref(vm, NJ_THIS(args), t, NJ_ARG_REF(args, 0));
+    }
+    if (b) {
+        nj_field_write_ref(vm, NJ_THIS(args), b, NJ_ARG_REF(args, 1));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_sn_setsoftkeys)
+{
+    nj_field *l = NJ_F(vm, NJ_C_SNIMPL, "snLeft", "Ljava/lang/String;");
+    nj_field *r = NJ_F(vm, NJ_C_SNIMPL, "snRight", "Ljava/lang/String;");
+    if (l) {
+        nj_field_write_ref(vm, NJ_THIS(args), l, NJ_ARG_REF(args, 0));
+    }
+    if (r) {
+        nj_field_write_ref(vm, NJ_THIS(args), r, NJ_ARG_REF(args, 1));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_sn_setimage)
+{
+    nj_field *f = NJ_F(vm, NJ_C_SNIMPL, "snImg", "[B");
+    if (f) {
+        nj_field_write_ref(vm, NJ_THIS(args), f, NJ_ARG_REF(args, 0));
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_gz_init)
+{
+    nj_field *f = NJ_F(vm, NJ_C_GESTZONE, "gzType", "I");
+    if (f) {
+        nj_iput(vm, NJ_THIS(args), f, NJ_ARG_INT(args, 0));
+    }
+    return NJ_OK;
+}
+NJFN(nokia_gz_type)
+{
+    nj_field *f = NJ_F(vm, NJ_C_GESTZONE, "gzType", "I");
+    ret->i = f ? nj_iget(vm, NJ_THIS(args), f) : 0;
+    return NJ_OK;
+}
+NJFN(nokia_gest_register)
+{
+    /* No gesture recogniser: registration is accepted but nothing fires. */
+    ret->i = 0;
+    return NJ_OK;
+}
+NJFN(nokia_gest_setlistener) { return NJ_OK; }
+
+
+/* ------------------------------------------------------------------ */
+/* CanvasItem / CanvasGraphicsItem                                      */
+/* ------------------------------------------------------------------ */
+/*
+ * Nokia's overlay items.  A midlet creates a CanvasGraphicsItem subclass,
+ * attaches it to a Canvas and draws into it from its own paint(); the device
+ * composites the items on top of the canvas.  KEmulator leaves the canvas
+ * registration hook empty, but a real handset (and games that use the API for
+ * HUD overlays) expects the item's paint() to run, so the runtime composites
+ * the attached, visible items onto the canvas backing image right after the
+ * canvas paint.
+ *
+ * CanvasItem itself is abstract; it only carries state.  The list of attached
+ * items lives in the Canvas builtin as the package-private `cItems` Vector
+ * (created lazily on the first attach), which keeps the ownership in the
+ * object graph instead of a side table the GC would not see.
+ */
+#define NJ_C_CANVASITEM    "com/nokia/mid/ui/CanvasItem"
+#define NJ_C_CANVASGFXITEM "com/nokia/mid/ui/CanvasGraphicsItem"
+
+static const nj_builtin_field canvasitem_fields[] = {
+    { "ciParent",  "Ljava/lang/Object;", NJ_ACC_PRIVATE },
+    { "ciW",       "I", NJ_ACC_PRIVATE },
+    { "ciH",       "I", NJ_ACC_PRIVATE },
+    { "ciX",       "I", NJ_ACC_PRIVATE },
+    { "ciY",       "I", NJ_ACC_PRIVATE },
+    { "ciZ",       "I", NJ_ACC_PRIVATE },
+    { "ciVisible", "Z", NJ_ACC_PRIVATE }
+};
+
+static const nj_builtin_method canvasitem_methods[] = {
+    M("setParent",    "(Ljava/lang/Object;)V", NJ_ACC_PUBLIC),
+    M("getParent",    "()Ljava/lang/Object;",  NJ_ACC_PUBLIC),
+    M("setSize",      "(II)V",                 NJ_ACC_PUBLIC),
+    M("getWidth",     "()I",                   NJ_ACC_PUBLIC),
+    M("getHeight",    "()I",                   NJ_ACC_PUBLIC),
+    M("setPosition",  "(II)V",                 NJ_ACC_PUBLIC),
+    M("getPositionX", "()I",                   NJ_ACC_PUBLIC),
+    M("getPositionY", "()I",                   NJ_ACC_PUBLIC),
+    M("setVisible",   "(Z)V",                  NJ_ACC_PUBLIC),
+    M("isVisible",    "()Z",                   NJ_ACC_PUBLIC),
+    M("setZPosition", "(I)V",                  NJ_ACC_PUBLIC),
+    M("getZPosition", "()I",                   NJ_ACC_PUBLIC)
+};
+
+static const nj_builtin_method canvasgfx_methods[] = {
+    M("<init>",       "(II)V", NJ_ACC_PUBLIC),
+    M("setParent",    "(Ljava/lang/Object;)V", NJ_ACC_PUBLIC),
+    M("setSize",      "(II)V",                 NJ_ACC_PUBLIC),
+    M("repaint",      "()V",                   NJ_ACC_PUBLIC | NJ_ACC_FINAL),
+    M("repaint",      "(IIII)V",               NJ_ACC_PUBLIC | NJ_ACC_FINAL),
+    M("setZPosition", "(I)V",                  NJ_ACC_PUBLIC),
+    M("getZPosition", "()I",                   NJ_ACC_PUBLIC),
+    M("paint",        "(L" NJ_C_GRAPHICS ";)V",
+       NJ_ACC_PROTECTED | NJ_ACC_ABSTRACT),
+    M("_invokePaint", "(L" NJ_C_GRAPHICS ";)V",
+       NJ_ACC_PUBLIC | NJ_ACC_FINAL)
+};
+
+static nj_field *ci_field(nj_vm *vm, const char *name, const char *desc)
+{
+    return NJ_F(vm, NJ_C_CANVASITEM, name, desc);
+}
+
+static nj_ref ci_parent(nj_vm *vm, nj_ref item)
+{
+    nj_field *f = ci_field(vm, "ciParent", "Ljava/lang/Object;");
+    return f ? nj_field_read_ref(vm, item, f) : NULL;
+}
+
+static void ci_set_parent(nj_vm *vm, nj_ref item, nj_ref parent)
+{
+    nj_field *f = ci_field(vm, "ciParent", "Ljava/lang/Object;");
+    if (f) {
+        nj_field_write_ref(vm, item, f, parent);
+    }
+}
+
+static nj_s4 ci_int(nj_vm *vm, nj_ref item, const char *name)
+{
+    nj_field *f = ci_field(vm, name, "I");
+    return f ? nj_field_read_int(vm, item, f) : 0;
+}
+
+static void ci_set_int(nj_vm *vm, nj_ref item, const char *name, nj_s4 v)
+{
+    nj_field *f = ci_field(vm, name, "I");
+    if (f) {
+        nj_field_write_int(vm, item, f, v);
+    }
+}
+
+static int ci_visible(nj_vm *vm, nj_ref item)
+{
+    nj_field *f = ci_field(vm, "ciVisible", "Z");
+    return f ? (nj_field_read_int(vm, item, f) != 0) : 0;
+}
+
+static void ci_set_visible(nj_vm *vm, nj_ref item, int visible)
+{
+    nj_field *f = ci_field(vm, "ciVisible", "Z");
+    if (f) {
+        nj_field_write_int(vm, item, f, visible ? 1 : 0);
+    }
+}
+
+/* The Canvas `cItems` Vector, optionally created on first use. */
+static nj_ref canvas_item_vector(nj_vm *vm, nj_ref canvas, int create)
+{
+    nj_field *f = NJ_F(vm, NJ_C_CANVAS, NJ_F_C_ITEMS, "Ljava/util/Vector;");
+    nj_ref vec;
+
+    if (!f) {
+        return NULL;
+    }
+    vec = nj_field_read_ref(vm, canvas, f);
+    if (!vec && create) {
+        vec = nj_object_new(vm, "java/util/Vector");
+        if (!vec) {
+            return NULL;
+        }
+        vec = nj_root(vm, vec);
+        (void)nj_call_special(vm, vec, "java/util/Vector", "<init>", "()V",
+                              NULL, NULL);
+        if (vm->exception) {
+            nj_clear_exception(vm);
+            return NULL;
+        }
+        nj_field_write_ref(vm, canvas, f, vec);
+    }
+    return vec;
+}
+
+static void canvas_item_detach(nj_vm *vm, nj_ref item)
+{
+    nj_ref parent = ci_parent(vm, item);
+    nj_ref vec;
+    nj_value a[1];
+
+    if (!parent) {
+        return;
+    }
+    vec = canvas_item_vector(vm, parent, 0);
+    if (vec) {
+        a[0].r = item;
+        (void)nj_call(vm, vec, "java/util/Vector", "removeElement",
+                      "(Ljava/lang/Object;)Z", a, NULL);
+        if (vm->exception) {
+            nj_clear_exception(vm);
+        }
+    }
+    ci_set_parent(vm, item, NULL);
+}
+
+static int canvas_item_attach(nj_vm *vm, nj_ref item, nj_ref parent)
+{
+    nj_ref old = ci_parent(vm, item);
+    nj_ref vec;
+    nj_value a[1];
+
+    if (old == parent) {
+        return 0;
+    }
+    if (old) {
+        canvas_item_detach(vm, item);
+    }
+    if (parent) {
+        vec = canvas_item_vector(vm, parent, 1);
+        if (!vec) {
+            return -1;
+        }
+        a[0].r = item;
+        if (nj_call(vm, vec, "java/util/Vector", "addElement",
+                    "(Ljava/lang/Object;)V", a, NULL) != NJ_OK) {
+            nj_clear_exception(vm);
+            return -1;
+        }
+        ci_set_parent(vm, item, parent);
+    }
+    return 0;
+}
+
+static void ci_throw_arg(nj_vm *vm, const char *what)
+{
+    (void)nj_throw(vm, "java/lang/IllegalArgumentException", what);
+}
+
+/* ---- CanvasItem natives (state accessors) ---- */
+NJFN(nokia_ci_set_parent)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref parent = NJ_ARG_REF(args, 0);
+
+    if (parent && !nj_midp_is_canvas(vm, parent)) {
+        ci_throw_arg(vm, "parent is not a Canvas");
+        return NJ_ERR;
+    }
+    if (canvas_item_attach(vm, item, parent) != 0) {
+        (void)nj_throw(vm, "java/lang/IllegalStateException",
+                       "could not attach the canvas item");
+        return NJ_ERR;
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_get_parent)
+{
+    ret->r = ci_parent(vm, NJ_THIS(args));
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_set_size)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 w = NJ_ARG_INT(args, 0);
+    nj_s4 h = NJ_ARG_INT(args, 1);
+
+    if (w < 1 || h < 1) {
+        ci_throw_arg(vm, "width and height must be positive");
+        return NJ_ERR;
+    }
+    ci_set_int(vm, item, "ciW", w);
+    ci_set_int(vm, item, "ciH", h);
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_get_width)
+{
+    ret->i = ci_int(vm, NJ_THIS(args), "ciW");
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_get_height)
+{
+    ret->i = ci_int(vm, NJ_THIS(args), "ciH");
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_set_position)
+{
+    nj_ref item = NJ_THIS(args);
+
+    ci_set_int(vm, item, "ciX", NJ_ARG_INT(args, 0));
+    ci_set_int(vm, item, "ciY", NJ_ARG_INT(args, 1));
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_get_position_x)
+{
+    ret->i = ci_int(vm, NJ_THIS(args), "ciX");
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_get_position_y)
+{
+    ret->i = ci_int(vm, NJ_THIS(args), "ciY");
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_set_visible)
+{
+    ci_set_visible(vm, NJ_THIS(args), NJ_ARG_INT(args, 0) != 0);
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_is_visible)
+{
+    ret->i = ci_visible(vm, NJ_THIS(args));
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_set_z)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 z = NJ_ARG_INT(args, 0);
+
+    if (z < 0) {
+        ci_throw_arg(vm, "z position must not be negative");
+        return NJ_ERR;
+    }
+    ci_set_int(vm, item, "ciZ", z);
+    return NJ_OK;
+}
+
+NJFN(nokia_ci_get_z)
+{
+    ret->i = ci_int(vm, NJ_THIS(args), "ciZ");
+    return NJ_OK;
+}
+
+/* ---- CanvasGraphicsItem natives ---- */
+NJFN(nokia_cgi_init)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 w = NJ_ARG_INT(args, 0);
+    nj_s4 h = NJ_ARG_INT(args, 1);
+
+    if (w < 1 || h < 1) {
+        ci_throw_arg(vm, "width and height must be positive");
+        return NJ_ERR;
+    }
+    ci_set_int(vm, item, "ciW", w);
+    ci_set_int(vm, item, "ciH", h);
+    ci_set_visible(vm, item, 0);
+    return NJ_OK;
+}
+
+NJFN(nokia_cgi_set_parent)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref parent = NJ_ARG_REF(args, 0);
+
+    if (parent && !nj_midp_is_canvas(vm, parent)) {
+        ci_throw_arg(vm, "parent is not a Canvas");
+        return NJ_ERR;
+    }
+    canvas_item_detach(vm, item);
+    if (parent) {
+        nj_ref vec = canvas_item_vector(vm, parent, 1);
+        nj_value a[1];
+        if (!vec) {
+            (void)nj_throw(vm, "java/lang/OutOfMemoryError",
+                           "could not create the canvas item list");
+            return NJ_ERR;
+        }
+        a[0].r = item;
+        if (nj_call(vm, vec, "java/util/Vector", "addElement",
+                    "(Ljava/lang/Object;)V", a, NULL) != NJ_OK) {
+            nj_clear_exception(vm);
+            (void)nj_throw(vm, "java/lang/IllegalStateException",
+                           "could not attach the canvas item");
+            return NJ_ERR;
+        }
+        ci_set_parent(vm, item, parent);
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_cgi_set_size)
+{
+    return nokia_ci_set_size(vm, th, args, ret);
+}
+
+NJFN(nokia_cgi_repaint)
+{
+    nj_ref item = NJ_THIS(args);
+
+    if (ci_parent(vm, item)) {
+        nj_midp_repaint(vm);
+    }
+    return NJ_OK;
+}
+
+NJFN(nokia_cgi_invoke_paint)
+{
+    nj_value a[1];
+
+    a[0].r = NJ_ARG_REF(args, 0);
+    return nj_call(vm, NJ_THIS(args), NJ_C_CANVASGFXITEM, "paint",
+                   "(L" NJ_C_GRAPHICS ";)V", a, NULL);
+}
+
+void nj_nokia_paint_canvas_items(nj_vm *vm, nj_ref canvas, nj_ref buffer)
+{
+    nj_ref vec;
+    nj_u4 mark;
+    int n, idx;
+
+    if (!canvas || !buffer) {
+        return;
+    }
+    vec = canvas_item_vector(vm, canvas, 0);
+    if (!vec) {
+        return;
+    }
+    mark = nj_root_mark(vm);
+    vec = nj_root(vm, vec);
+    buffer = nj_root(vm, buffer);
+    n = nj_call_int(vm, vec, "java/util/Vector", "size", "()I", NULL);
+    if (vm->exception) {
+        nj_clear_exception(vm);
+        n = 0;
+    }
+    for (idx = 0; idx < n; idx++) {
+        nj_ref item;
+        nj_ref g;
+        nj_value a[4];
+        nj_s4 w, h;
+        int st;
+
+        a[0].i = idx;
+        item = nj_call_ref(vm, vec, "java/util/Vector", "elementAt",
+                           "(I)Ljava/lang/Object;", a);
+        if (vm->exception) {
+            nj_clear_exception(vm);
+            break;
+        }
+        if (!item) {
+            continue;
+        }
+        item = nj_root(vm, item);
+        if (ci_parent(vm, item) != canvas || !ci_visible(vm, item)) {
+            continue;
+        }
+        w = ci_int(vm, item, "ciW");
+        h = ci_int(vm, item, "ciH");
+        if (w < 1 || h < 1) {
+            continue;
+        }
+        g = nj_midp_image_graphics(vm, buffer);
+        if (!g) {
+            break;
+        }
+        g = nj_root(vm, g);
+        a[0].i = ci_int(vm, item, "ciX");
+        a[1].i = ci_int(vm, item, "ciY");
+        if (nj_call(vm, g, NJ_C_GRAPHICS, "translate", "(II)V", a, NULL) !=
+            NJ_OK) {
+            nj_clear_exception(vm);
+            break;
+        }
+        a[0].i = 0;
+        a[1].i = 0;
+        a[2].i = w;
+        a[3].i = h;
+        if (nj_call(vm, g, NJ_C_GRAPHICS, "setClip", "(IIII)V", a, NULL) !=
+            NJ_OK) {
+            nj_clear_exception(vm);
+            break;
+        }
+        a[0].r = g;
+        /* Dispatch on the item's real class so TextEditor (and any other
+         * CanvasItem subclass declaring _invokePaint) paints itself. */
+        st = nj_call(vm, item, nj_ref_class_name(item), "_invokePaint",
+                     "(L" NJ_C_GRAPHICS ";)V", a, NULL);
+        if (st != NJ_OK) {
+            nj_clear_exception(vm);
+            break;
+        }
+    }
+    nj_root_release(vm, mark);
+}
+
+/* ---- Nokia TextEditor (round 190) ------------------------------------- */
+
+#define NJ_C_STRING "java/lang/String"
+
+static const nj_builtin_field texteditor_fields[] = {
+    { "teContent",    "Ljava/lang/String;",                 NJ_ACC_PRIVATE },
+    { "teFont",       "Ljavax/microedition/lcdui/Font;",    NJ_ACC_PRIVATE },
+    { "teMaxSize",    "I",                                  NJ_ACC_PRIVATE },
+    { "teConstraints","I",                                  NJ_ACC_PRIVATE },
+    { "teRows",       "I",                                  NJ_ACC_PRIVATE },
+    { "teMultiline",  "Z",                                  NJ_ACC_PRIVATE },
+    { "teListener",   "Ljava/lang/Object;",                 NJ_ACC_PRIVATE },
+    { "teBg",         "I",                                  NJ_ACC_PRIVATE },
+    { "teFg",         "I",                                  NJ_ACC_PRIVATE },
+    { "teFocusBg",    "I",                                  NJ_ACC_PRIVATE },
+    { "teFocusFg",    "I",                                  NJ_ACC_PRIVATE },
+    { "teFocusBgSet", "Z",                                  NJ_ACC_PRIVATE },
+    { "teFocusFgSet", "Z",                                  NJ_ACC_PRIVATE },
+    { "teFocused",    "Z",                                  NJ_ACC_PRIVATE },
+    { "teCaret",      "I",                                  NJ_ACC_PRIVATE },
+    { "teSelIndex",   "I",                                  NJ_ACC_PRIVATE },
+    { "teSelLen",     "I",                                  NJ_ACC_PRIVATE },
+    { "teSubset",     "Ljava/lang/String;",                 NJ_ACC_PRIVATE }
+};
+
+static const nj_builtin_method texteditor_methods[] = {
+    M("createTextEditor", "(Ljava/lang/String;IIII)Lcom/nokia/mid/ui/TextEditor;",
+      NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("createTextEditor", "(IIII)Lcom/nokia/mid/ui/TextEditor;",
+      NJ_ACC_PUBLIC | NJ_ACC_STATIC),
+    M("<init>", "(Ljava/lang/String;IIIIZ)V", NJ_ACC_PRIVATE),
+    M("setFocus", "(Z)V", NJ_ACC_PUBLIC),
+    M("hasFocus", "()Z", NJ_ACC_PUBLIC),
+    M("setParent", "(Ljava/lang/Object;)V", NJ_ACC_PUBLIC),
+    M("setSize", "(II)V", NJ_ACC_PUBLIC),
+    M("setSize", "(IIII)V", NJ_ACC_PUBLIC),
+    M("setPosition", "(II)V", NJ_ACC_PUBLIC),
+    M("setVisible", "(Z)V", NJ_ACC_PUBLIC),
+    M("setZPosition", "(I)V", NJ_ACC_PUBLIC),
+    M("getZPosition", "()I", NJ_ACC_PUBLIC),
+    M("getLineMarginHeight", "()I", NJ_ACC_PUBLIC),
+    M("getContentHeight", "()I", NJ_ACC_PUBLIC),
+    M("getHeight", "()I", NJ_ACC_PUBLIC),
+    M("getWidth", "()I", NJ_ACC_PUBLIC),
+    M("setCaret", "(I)V", NJ_ACC_PUBLIC),
+    M("getCaretPosition", "()I", NJ_ACC_PUBLIC),
+    M("getVisibleContentPosition", "()I", NJ_ACC_PUBLIC),
+    M("getFont", "()Ljavax/microedition/lcdui/Font;", NJ_ACC_PUBLIC),
+    M("setFont", "(Ljavax/microedition/lcdui/Font;)V", NJ_ACC_PUBLIC),
+    M("getBackgroundColor", "()I", NJ_ACC_PUBLIC),
+    M("getForegroundColor", "()I", NJ_ACC_PUBLIC),
+    M("setBackgroundColor", "(I)V", NJ_ACC_PUBLIC),
+    M("setForegroundColor", "(I)V", NJ_ACC_PUBLIC),
+    M("setHighlightBackgroundColor", "(I)V", NJ_ACC_PUBLIC),
+    M("setHighlightForegroundColor", "(I)V", NJ_ACC_PUBLIC),
+    M("setContent", "(Ljava/lang/String;)V", NJ_ACC_PUBLIC),
+    M("getContent", "()Ljava/lang/String;", NJ_ACC_PUBLIC),
+    M("insert", "(Ljava/lang/String;I)V", NJ_ACC_PUBLIC),
+    M("delete", "(II)V", NJ_ACC_PUBLIC),
+    M("getMaxSize", "()I", NJ_ACC_PUBLIC),
+    M("setMaxSize", "(I)V", NJ_ACC_PUBLIC),
+    M("size", "()I", NJ_ACC_PUBLIC),
+    M("setConstraints", "(I)V", NJ_ACC_PUBLIC),
+    M("getConstraints", "()I", NJ_ACC_PUBLIC),
+    M("setInitialInputMode", "(Ljava/lang/String;)V", NJ_ACC_PUBLIC),
+    M("getInitialInputMode", "()Ljava/lang/String;", NJ_ACC_PUBLIC),
+    M("setSelection", "(II)V", NJ_ACC_PUBLIC),
+    M("getSelection", "()Ljava/lang/String;", NJ_ACC_PUBLIC),
+    M("setTextEditorListener", "(Lcom/nokia/mid/ui/TextEditorListener;)V", NJ_ACC_PUBLIC),
+    M("isMultiline", "()Z", NJ_ACC_PUBLIC),
+    M("setMultiline", "(Z)V", NJ_ACC_PUBLIC),
+    M("setIndicatorVisibility", "(Z)V", NJ_ACC_PUBLIC),
+    M("_invokePaint", "(Ljavax/microedition/lcdui/Graphics;)V", NJ_ACC_PUBLIC),
+    M("_contentChanged", "(Ljava/lang/String;)V", NJ_ACC_PUBLIC),
+    M("_inputAction", "(I)V", NJ_ACC_PUBLIC)
+};
+
+static const nj_builtin_field telistener_fields[] = {
+    { "ACTION_CONTENT_CHANGE",      "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_OPTIONS_CHANGE",      "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_CARET_MOVE",          "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_TRAVERSE_PREVIOUS",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_TRAVERSE_NEXT",       "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_PAINT_REQUEST",       "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_DIRECTION_CHANGE",    "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_INPUT_MODE_CHANGE",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_LANGUAGE_CHANGE",     "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_TRAVERSE_OUT_SCROLL_UP",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_TRAVERSE_OUT_SCROLL_DOWN", "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL },
+    { "ACTION_SCROLLBAR_CHANGED",   "I", NJ_ACC_PUBLIC | NJ_ACC_STATIC | NJ_ACC_FINAL }
+};
+
+static const nj_builtin_method telistener_methods[] = {
+    M("inputAction", "(Lcom/nokia/mid/ui/TextEditor;I)V",
+      NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT)
+};
+
+/* Field helpers: TextEditor keeps everything in private ints/refs. */
+static nj_field *te_field(nj_vm *vm, const char *name, const char *desc)
+{
+    return NJ_F(vm, NJ_C_TEXTEDITOR, name, desc);
+}
+
+static nj_s4 te_i(nj_vm *vm, nj_ref o, const char *name)
+{
+    nj_field *f = te_field(vm, name, "I");
+    return f ? nj_field_read_int(vm, o, f) : 0;
+}
+
+static void te_si(nj_vm *vm, nj_ref o, const char *name, nj_s4 v)
+{
+    nj_field *f = te_field(vm, name, "I");
+    if (f) {
+        nj_field_write_int(vm, o, f, v);
+    }
+}
+
+static int te_z(nj_vm *vm, nj_ref o, const char *name)
+{
+    nj_field *f = te_field(vm, name, "Z");
+    return f ? (nj_field_read_int(vm, o, f) != 0) : 0;
+}
+
+static void te_sz(nj_vm *vm, nj_ref o, const char *name, int v)
+{
+    nj_field *f = te_field(vm, name, "Z");
+    if (f) {
+        nj_field_write_int(vm, o, f, v ? 1 : 0);
+    }
+}
+
+static nj_ref te_o(nj_vm *vm, nj_ref o, const char *name, const char *desc)
+{
+    nj_field *f = te_field(vm, name, desc);
+    return f ? nj_field_read_ref(vm, o, f) : NULL;
+}
+
+static void te_so(nj_vm *vm, nj_ref o, const char *name, const char *desc,
+                  nj_ref v)
+{
+    nj_field *f = te_field(vm, name, desc);
+    if (f) {
+        nj_field_write_ref(vm, o, f, v);
+    }
+}
+
+static nj_s4 te_len(nj_vm *vm, nj_ref s)
+{
+    return s ? nj_call_int(vm, s, NJ_C_STRING, "length", "()I", NULL) : 0;
+}
+
+static nj_ref te_sub(nj_vm *vm, nj_ref s, nj_s4 from, nj_s4 to)
+{
+    nj_value a[2];
+
+    a[0].i = from;
+    a[1].i = to;
+    return nj_call_ref(vm, s, NJ_C_STRING, "substring",
+                       "(II)Ljava/lang/String;", a);
+}
+
+static nj_ref te_cat(nj_vm *vm, nj_ref a, nj_ref b)
+{
+    nj_value av[1];
+
+    av[0].r = b;
+    return nj_call_ref(vm, a, NJ_C_STRING, "concat",
+                       "(Ljava/lang/String;)Ljava/lang/String;", av);
+}
+
+static void te_repaint(nj_vm *vm, nj_ref item)
+{
+    nj_ref parent = ci_parent(vm, item);
+    if (parent && ci_visible(vm, item)) {
+        nj_midp_repaint(vm);
+    }
+}
+
+static nj_ref te_font(nj_vm *vm, nj_ref item)
+{
+    nj_ref f = te_o(vm, item, "teFont", "L" NJ_C_FONT ";");
+    if (!f) {
+        f = nj_call_ref(vm, NULL, NJ_C_FONT, "getDefaultFont",
+                        "()L" NJ_C_FONT ";", NULL);
+    }
+    return f;
+}
+
+static nj_s4 te_font_height(nj_vm *vm, nj_ref font)
+{
+    nj_s4 h = font ? nj_call_int(vm, font, NJ_C_FONT, "getHeight", "()I",
+                                 NULL) : 0;
+    return h > 0 ? h : 12;
+}
+
+static nj_s4 te_content_height(nj_vm *vm, nj_ref item)
+{
+    nj_s4 fh = te_font_height(vm, te_font(vm, item));
+    return 4 + (fh + 4);
+}
+
+static void te_set_content(nj_vm *vm, nj_ref item, nj_ref text)
+{
+    te_so(vm, item, "teContent", "Ljava/lang/String;", text);
+    te_repaint(vm, item);
+}
+
+static void te_store_size(nj_vm *vm, nj_ref item, nj_s4 w, nj_s4 h)
+{
+    te_si(vm, item, "ciW", w);
+    te_si(vm, item, "ciH", h);
+}
+
+/* ---- TextEditor natives ---- */
+
+NJFN(nokia_te_init)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref text = NJ_ARG_REF(args, 0);
+    nj_s4 max = NJ_ARG_INT(args, 1);
+    nj_s4 cons = NJ_ARG_INT(args, 2);
+    nj_s4 w = NJ_ARG_INT(args, 3);
+    nj_s4 h = NJ_ARG_INT(args, 4);
+    int rows = NJ_ARG_INT(args, 5) != 0;
+
+    if (max < 1) {
+        ci_throw_arg(vm, "maxSize must be positive");
+        return NJ_ERR;
+    }
+    if (w < 1 || h < 1) {
+        ci_throw_arg(vm, "width and height must be positive");
+        return NJ_ERR;
+    }
+    if (!text) {
+        ci_throw_arg(vm, "text must not be null");
+        return NJ_ERR;
+    }
+    if (te_len(vm, text) > max) {
+        ci_throw_arg(vm, "text is longer than maxSize");
+        return NJ_ERR;
+    }
+    te_so(vm, item, "teContent", "Ljava/lang/String;", text);
+    te_si(vm, item, "ciW", w);
+    te_si(vm, item, "ciH", rows ? -1 : h);
+    te_si(vm, item, "teMaxSize", max);
+    te_si(vm, item, "teConstraints", cons);
+    te_si(vm, item, "teRows", rows ? h : 0);
+    te_sz(vm, item, "teMultiline", rows && h > 1);
+    te_si(vm, item, "teBg", 0);
+    te_si(vm, item, "teFg", 0);
+    te_si(vm, item, "teCaret", 0);
+    te_si(vm, item, "teSelIndex", 0);
+    te_si(vm, item, "teSelLen", 0);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_create1)
+{
+    nj_ref text = NJ_ARG_REF(args, 0);
+    nj_s4 max = NJ_ARG_INT(args, 1);
+    nj_s4 cons = NJ_ARG_INT(args, 2);
+    nj_s4 w = NJ_ARG_INT(args, 3);
+    nj_s4 h = NJ_ARG_INT(args, 4);
+    nj_value a[6];
+    nj_ref inst;
+
+    inst = nj_object_new(vm, NJ_C_TEXTEDITOR);
+    if (!inst) {
+        return NJ_ERR;
+    }
+    inst = nj_root(vm, inst);
+    a[0].r = text;
+    a[1].i = max;
+    a[2].i = cons;
+    a[3].i = w;
+    a[4].i = h;
+    a[5].i = 0;
+    if (nj_call_special(vm, inst, NJ_C_TEXTEDITOR, "<init>",
+                        "(Ljava/lang/String;IIIIZ)V", a, NULL) != NJ_OK) {
+        return NJ_ERR;
+    }
+    ret->r = inst;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_create2)
+{
+    nj_s4 max = NJ_ARG_INT(args, 0);
+    nj_s4 cons = NJ_ARG_INT(args, 1);
+    nj_s4 w = NJ_ARG_INT(args, 2);
+    nj_s4 rows = NJ_ARG_INT(args, 3);
+    nj_value a[6];
+    nj_ref inst;
+    nj_ref empty = nj_root(vm, nj_string_new(vm, ""));
+
+    inst = nj_object_new(vm, NJ_C_TEXTEDITOR);
+    if (!inst) {
+        return NJ_ERR;
+    }
+    inst = nj_root(vm, inst);
+    a[0].r = empty;
+    a[1].i = max;
+    a[2].i = cons;
+    a[3].i = w;
+    a[4].i = rows;
+    a[5].i = 1;
+    if (nj_call_special(vm, inst, NJ_C_TEXTEDITOR, "<init>",
+                        "(Ljava/lang/String;IIIIZ)V", a, NULL) != NJ_OK) {
+        return NJ_ERR;
+    }
+    ret->r = inst;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_focus)
+{
+    nj_ref item = NJ_THIS(args);
+    te_sz(vm, item, "teFocused", NJ_ARG_INT(args, 0) != 0);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_has_focus)
+{
+    ret->i = te_z(vm, NJ_THIS(args), "teFocused") ? 1 : 0;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_size)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 w = NJ_ARG_INT(args, 0);
+    nj_s4 h = NJ_ARG_INT(args, 1);
+
+    if (w < 1 || h < 1) {
+        ci_throw_arg(vm, "width and height must be positive");
+        return NJ_ERR;
+    }
+    te_store_size(vm, item, w, h);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_size4)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 w = NJ_ARG_INT(args, 2);
+    nj_s4 h = NJ_ARG_INT(args, 3);
+
+    if (w < 1 || h < 1) {
+        ci_throw_arg(vm, "width and height must be positive");
+        return NJ_ERR;
+    }
+    te_si(vm, item, "ciX", NJ_ARG_INT(args, 0));
+    te_si(vm, item, "ciY", NJ_ARG_INT(args, 1));
+    te_store_size(vm, item, w, h);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_position)
+{
+    nj_ref item = NJ_THIS(args);
+
+    te_si(vm, item, "ciX", NJ_ARG_INT(args, 0));
+    te_si(vm, item, "ciY", NJ_ARG_INT(args, 1));
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_visible)
+{
+    nj_ref item = NJ_THIS(args);
+
+    ci_set_visible(vm, item, NJ_ARG_INT(args, 0) != 0);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_z)
+{
+    nj_s4 z = NJ_ARG_INT(args, 0);
+    if (z < 0) {
+        ci_throw_arg(vm, "z position must not be negative");
+        return NJ_ERR;
+    }
+    te_si(vm, NJ_THIS(args), "ciZ", z);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_z)
+{
+    ret->i = te_i(vm, NJ_THIS(args), "ciZ");
+    return NJ_OK;
+}
+
+NJFN(nokia_te_line_margin)
+{
+    ret->i = 0;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_content_height)
+{
+    ret->i = te_content_height(vm, NJ_THIS(args));
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_height)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 h = te_i(vm, item, "ciH");
+
+    ret->i = h > 0 ? h : te_content_height(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_width)
+{
+    ret->i = te_i(vm, NJ_THIS(args), "ciW");
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_caret)
+{
+    nj_ref item = NJ_THIS(args);
+
+    te_si(vm, item, "teCaret", NJ_ARG_INT(args, 0));
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_caret)
+{
+    nj_ref item = NJ_THIS(args);
+    ret->i = te_z(vm, item, "teFocused") ? te_i(vm, item, "teCaret") : 0;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_visible_content)
+{
+    ret->i = 0;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_font)
+{
+    ret->r = te_font(vm, NJ_THIS(args));
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_font)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref font = NJ_ARG_REF(args, 0);
+
+    if (!font) {
+        font = nj_call_ref(vm, NULL, NJ_C_FONT, "getDefaultFont",
+                           "()L" NJ_C_FONT ";", NULL);
+        if (!font) {
+            return NJ_ERR;
+        }
+        nj_clear_exception(vm);
+    }
+    te_so(vm, item, "teFont", "L" NJ_C_FONT ";", font);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_bg) { ret->i = te_i(vm, NJ_THIS(args), "teBg"); return NJ_OK; }
+NJFN(nokia_te_get_fg) { ret->i = te_i(vm, NJ_THIS(args), "teFg"); return NJ_OK; }
+
+NJFN(nokia_te_set_bg)
+{
+    nj_ref item = NJ_THIS(args);
+    te_si(vm, item, "teBg", NJ_ARG_INT(args, 0));
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_fg)
+{
+    nj_ref item = NJ_THIS(args);
+    te_si(vm, item, "teFg", NJ_ARG_INT(args, 0));
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_focus_bg)
+{
+    nj_ref item = NJ_THIS(args);
+    te_si(vm, item, "teFocusBg", NJ_ARG_INT(args, 0));
+    te_sz(vm, item, "teFocusBgSet", 1);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_focus_fg)
+{
+    nj_ref item = NJ_THIS(args);
+    te_si(vm, item, "teFocusFg", NJ_ARG_INT(args, 0));
+    te_sz(vm, item, "teFocusFgSet", 1);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_content)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref text = NJ_ARG_REF(args, 0);
+    nj_s4 max = te_i(vm, item, "teMaxSize");
+
+    if (!text) {
+        ci_throw_arg(vm, "content must not be null");
+        return NJ_ERR;
+    }
+    if (te_len(vm, text) > max) {
+        ci_throw_arg(vm, "content is longer than maxSize");
+        return NJ_ERR;
+    }
+    te_set_content(vm, item, text);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_content)
+{
+    ret->r = te_o(vm, NJ_THIS(args), "teContent", "Ljava/lang/String;");
+    return NJ_OK;
+}
+
+NJFN(nokia_te_insert)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref text = NJ_ARG_REF(args, 0);
+    nj_s4 pos = NJ_ARG_INT(args, 1);
+    nj_ref cur;
+    nj_s4 clen;
+    nj_s4 tlen;
+    nj_s4 max;
+    nj_u4 mark;
+    nj_ref head;
+    nj_ref mid;
+    nj_ref tail;
+    nj_ref whole;
+
+    if (!text) {
+        ci_throw_arg(vm, "text must not be null");
+        return NJ_ERR;
+    }
+    cur = te_o(vm, item, "teContent", "Ljava/lang/String;");
+    clen = te_len(vm, cur);
+    tlen = te_len(vm, text);
+    max = te_i(vm, item, "teMaxSize");
+    if (pos < 0 || pos > clen) {
+        (void)nj_throw(vm, "java/lang/StringIndexOutOfBoundsException", NULL);
+        return NJ_ERR;
+    }
+    if (clen + tlen > max) {
+        ci_throw_arg(vm, "content would exceed maxSize");
+        return NJ_ERR;
+    }
+    mark = nj_root_mark(vm);
+    head = te_sub(vm, cur, 0, pos);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    head = nj_root(vm, head);
+    mid = te_cat(vm, head, text);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    mid = nj_root(vm, mid);
+    tail = te_sub(vm, cur, pos, clen);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    tail = nj_root(vm, tail);
+    whole = te_cat(vm, mid, tail);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    te_set_content(vm, item, whole);
+    nj_root_release(vm, mark);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_delete)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 off = NJ_ARG_INT(args, 0);
+    nj_s4 len = NJ_ARG_INT(args, 1);
+    nj_ref cur = te_o(vm, item, "teContent", "Ljava/lang/String;");
+    nj_s4 clen = te_len(vm, cur);
+    nj_u4 mark;
+    nj_ref head;
+    nj_ref tail;
+    nj_ref whole;
+
+    if (off < 0 || len < 0 || off + len > clen) {
+        (void)nj_throw(vm, "java/lang/StringIndexOutOfBoundsException", NULL);
+        return NJ_ERR;
+    }
+    if (len == 0) {
+        return NJ_OK;
+    }
+    mark = nj_root_mark(vm);
+    head = te_sub(vm, cur, 0, off);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    head = nj_root(vm, head);
+    tail = te_sub(vm, cur, off + len, clen);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    whole = te_cat(vm, head, tail);
+    if (vm->exception) {
+        nj_root_release(vm, mark);
+        return NJ_ERR;
+    }
+    te_set_content(vm, item, whole);
+    nj_root_release(vm, mark);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_max_size)
+{
+    ret->i = te_i(vm, NJ_THIS(args), "teMaxSize");
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_max_size)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 max = NJ_ARG_INT(args, 0);
+    nj_ref cur;
+    nj_s4 clen;
+
+    if (max < 1) {
+        ci_throw_arg(vm, "maxSize must be positive");
+        return NJ_ERR;
+    }
+    cur = te_o(vm, item, "teContent", "Ljava/lang/String;");
+    clen = te_len(vm, cur);
+    te_si(vm, item, "teMaxSize", max);
+    if (clen > max) {
+        nj_ref cut = te_sub(vm, cur, 0, max);
+        if (vm->exception) {
+            return NJ_ERR;
+        }
+        te_set_content(vm, item, cut);
+    }
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_size)
+{
+    ret->i = te_len(vm, te_o(vm, NJ_THIS(args), "teContent",
+                             "Ljava/lang/String;"));
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_constraints)
+{
+    te_si(vm, NJ_THIS(args), "teConstraints", NJ_ARG_INT(args, 0));
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_constraints)
+{
+    ret->i = te_i(vm, NJ_THIS(args), "teConstraints");
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_mode)
+{
+    te_so(vm, NJ_THIS(args), "teSubset", "Ljava/lang/String;",
+          NJ_ARG_REF(args, 0));
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_mode)
+{
+    ret->r = te_o(vm, NJ_THIS(args), "teSubset", "Ljava/lang/String;");
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_selection)
+{
+    nj_ref item = NJ_THIS(args);
+    te_si(vm, item, "teSelIndex", NJ_ARG_INT(args, 0));
+    te_si(vm, item, "teSelLen", NJ_ARG_INT(args, 1));
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_get_selection)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_s4 idx = te_i(vm, item, "teSelIndex");
+    nj_s4 len = te_i(vm, item, "teSelLen");
+    nj_ref cur;
+
+    if (!te_z(vm, item, "teFocused") || len <= 0 || idx < 0) {
+        ret->r = NULL;
+        return NJ_OK;
+    }
+    cur = te_o(vm, item, "teContent", "Ljava/lang/String;");
+    ret->r = te_sub(vm, cur, idx, idx + len);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_listener)
+{
+    te_so(vm, NJ_THIS(args), "teListener", "Ljava/lang/Object;",
+          NJ_ARG_REF(args, 0));
+    return NJ_OK;
+}
+
+NJFN(nokia_te_is_multiline)
+{
+    ret->i = te_z(vm, NJ_THIS(args), "teMultiline") ? 1 : 0;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_multiline)
+{
+    nj_ref item = NJ_THIS(args);
+    te_sz(vm, item, "teMultiline", NJ_ARG_INT(args, 0) != 0);
+    te_repaint(vm, item);
+    return NJ_OK;
+}
+
+NJFN(nokia_te_set_indicator)
+{
+    (void)args;
+    (void)ret;
+    return NJ_OK;
+}
+
+NJFN(nokia_te_invoke_paint)
+{
+    nj_ref item = NJ_THIS(args);
+    nj_ref g = NJ_ARG_REF(args, 0);
+    /* The CanvasItem painter already translated to the item's position and
+     * clipped to its rectangle, so paint in item-local coordinates. */
+    nj_s4 x = 0;
+    nj_s4 y = 0;
+    nj_s4 w = te_i(vm, item, "ciW");
+    nj_s4 h = te_i(vm, item, "ciH");
+    nj_ref content = te_o(vm, item, "teContent", "Ljava/lang/String;");
+    nj_s4 len = te_len(vm, content);
+    nj_value a[4];
+    int focused = te_z(vm, item, "teFocused");
+
+    if (!g) {
+        return NJ_OK;
+    }
+    if (h <= 0) {
+        h = te_content_height(vm, item);
+    }
+    a[0].i = (focused && te_z(vm, item, "teFocusBgSet"))
+                 ? te_i(vm, item, "teFocusBg")
+                 : te_i(vm, item, "teBg");
+    if (nj_call(vm, g, NJ_C_GRAPHICS, "setColor", "(I)V", a, NULL) != NJ_OK) {
+        nj_clear_exception(vm);
+        return NJ_OK;
+    }
+    a[0].i = x;
+    a[1].i = y;
+    a[2].i = w;
+    a[3].i = h;
+    if (nj_call(vm, g, NJ_C_GRAPHICS, "fillRect", "(IIII)V", a, NULL) != NJ_OK) {
+        nj_clear_exception(vm);
+        return NJ_OK;
+    }
+    if (len <= 0) {
+        return NJ_OK;
+    }
+    {
+        nj_ref font = te_font(vm, item);
+        if (font) {
+            nj_value fa[1];
+            fa[0].r = font;
+            if (nj_call(vm, g, NJ_C_GRAPHICS, "setFont",
+                        "(L" NJ_C_FONT ";)V", fa, NULL) != NJ_OK) {
+                nj_clear_exception(vm);
+                return NJ_OK;
+            }
+        }
+    }
+    a[0].i = (focused && te_z(vm, item, "teFocusFgSet"))
+                 ? te_i(vm, item, "teFocusFg")
+                 : te_i(vm, item, "teFg");
+    if (nj_call(vm, g, NJ_C_GRAPHICS, "setColor", "(I)V", a, NULL) != NJ_OK) {
+        nj_clear_exception(vm);
+        return NJ_OK;
+    }
+    {
+        nj_value da[4];
+        da[0].r = content;
+        da[1].i = x + 4;
+        da[2].i = y + 2;
+        da[3].i = 20;
+        if (nj_call(vm, g, NJ_C_GRAPHICS, "drawString",
+                    "(Ljava/lang/String;III)V", da, NULL) != NJ_OK) {
+            nj_clear_exception(vm);
+        }
+    }
+    return NJ_OK;
+}
+
+static void te_notify(nj_vm *vm, nj_ref item, nj_s4 action)
+{
+    nj_ref listener = te_o(vm, item, "teListener", "Ljava/lang/Object;");
+    nj_value a[2];
+
+    if (!listener) {
+        return;
+    }
+    a[0].r = item;
+    a[1].i = action;
+    if (nj_call(vm, listener, NJ_C_TELISTENER, "inputAction",
+                "(Lcom/nokia/mid/ui/TextEditor;I)V", a, NULL) != NJ_OK) {
+        nj_clear_exception(vm);
+    }
+}
+
+NJFN(nokia_te_content_changed)
+{
+    nj_ref item = NJ_THIS(args);
+
+    te_set_content(vm, item, NJ_ARG_REF(args, 0));
+    te_notify(vm, item, 0x1); /* ACTION_CONTENT_CHANGE */
+    return NJ_OK;
+}
+
+NJFN(nokia_te_input_action)
+{
+    nj_ref item = NJ_THIS(args);
+
+    te_notify(vm, item, NJ_ARG_INT(args, 0));
+    return NJ_OK;
+}
+
+const nj_builtin_class nj_lib_nokia_classes[] = {
+    { NJ_C_VKEYBOARD, "java/lang/Object", NJ_ACC_PUBLIC,
+      NULL, 0u, vkeyboard_methods,
+      (nj_u2)(sizeof(vkeyboard_methods) / sizeof(vkeyboard_methods[0])) },
+    { NJ_C_MPLISTEN, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, mplisten_methods,
+      (nj_u2)(sizeof(mplisten_methods) / sizeof(mplisten_methods[0])) },
+    { NJ_C_SVIB, "java/lang/Object", NJ_ACC_PUBLIC | NJ_ACC_FINAL,
+      NULL, 0u, svib_methods,
+      (nj_u2)(sizeof(svib_methods) / sizeof(svib_methods[0])) },
+    { NJ_C_MVIB, "java/util/TimerTask",
+      NJ_ACC_PUBLIC,
+      mvib_fields,
+      (nj_u2)(sizeof(mvib_fields) / sizeof(mvib_fields[0])),
+      mvib_methods,
+      (nj_u2)(sizeof(mvib_methods) / sizeof(mvib_methods[0])) },
+    { NJ_C_MPTOUCH, "java/lang/Object", NJ_ACC_PUBLIC,
+      mptouch_fields,
+      (nj_u2)(sizeof(mptouch_fields) / sizeof(mptouch_fields[0])),
+      mptouch_methods,
+      (nj_u2)(sizeof(mptouch_methods) / sizeof(mptouch_methods[0])) },
+    { NJ_C_SLISTEN, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, slisten_methods,
+      (nj_u2)(sizeof(slisten_methods) / sizeof(slisten_methods[0])) },
+    { NJ_C_FSELECT, "java/lang/Object", NJ_ACC_PUBLIC,
+      fselect_fields,
+      (nj_u2)(sizeof(fselect_fields) / sizeof(fselect_fields[0])),
+      fselect_methods,
+      (nj_u2)(sizeof(fselect_methods) / sizeof(fselect_methods[0])) },
+    { "com/nokia/mid/ui/FullCanvas", "javax/microedition/lcdui/Canvas",
+      NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT,
+      fullcanvas_fields,
+      (nj_u2)(sizeof(fullcanvas_fields) / sizeof(fullcanvas_fields[0])),
+      NULL, 0u },
+    { NJ_C_SOUND, "java/lang/Object", NJ_ACC_PUBLIC,
+      sound_fields,
+      (nj_u2)(sizeof(sound_fields) / sizeof(sound_fields[0])),
+      sound_methods,
+      (nj_u2)(sizeof(sound_methods) / sizeof(sound_methods[0])) },
+    { NJ_C_FSDETAIL, "java/lang/Object", NJ_ACC_PUBLIC,
+      fsdetail_fields,
+      (nj_u2)(sizeof(fsdetail_fields) / sizeof(fsdetail_fields[0])),
+      fsdetail_methods,
+      (nj_u2)(sizeof(fsdetail_methods) / sizeof(fsdetail_methods[0])) },
+    { NJ_C_DGRAPHICS, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      dgraphics_fields,
+      (nj_u2)(sizeof(dgraphics_fields) / sizeof(dgraphics_fields[0])),
+      dgraphics_methods,
+      (nj_u2)(sizeof(dgraphics_methods) / sizeof(dgraphics_methods[0])) },
+    { NJ_C_DUTILS, "java/lang/Object", NJ_ACC_PUBLIC,
+      NULL, 0u, dutils_methods,
+      (nj_u2)(sizeof(dutils_methods) / sizeof(dutils_methods[0])) },
+    { NJ_C_DEVCTL, "java/lang/Object", NJ_ACC_PUBLIC,
+      NULL, 0u, devctl_methods,
+      (nj_u2)(sizeof(devctl_methods) / sizeof(devctl_methods[0])) },
+    { NJ_C_DGIMPL, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, NULL, 0u },
+    { NJ_C_CLIPBOARD, "java/lang/Object",
+      NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT,
+      clipboard_fields,
+      (nj_u2)(sizeof(clipboard_fields) / sizeof(clipboard_fields[0])),
+      clipboard_methods,
+      (nj_u2)(sizeof(clipboard_methods) / sizeof(clipboard_methods[0])) },
+    { NJ_C_GLOBIND, "java/lang/Object", NJ_ACC_PUBLIC | NJ_ACC_FINAL,
+      globind_fields,
+      (nj_u2)(sizeof(globind_fields) / sizeof(globind_fields[0])),
+      globind_methods,
+      (nj_u2)(sizeof(globind_methods) / sizeof(globind_methods[0])) },
+    { NJ_C_GLOBINDEXC, "java/lang/Exception", NJ_ACC_PUBLIC,
+      globindexc_fields,
+      (nj_u2)(sizeof(globindexc_fields) / sizeof(globindexc_fields[0])),
+      globindexc_methods,
+      (nj_u2)(sizeof(globindexc_methods) / sizeof(globindexc_methods[0])) },
+    { NJ_C_TACTILE, "java/lang/Object", NJ_ACC_PUBLIC,
+      tactile_fields,
+      (nj_u2)(sizeof(tactile_fields) / sizeof(tactile_fields[0])),
+      tactile_methods,
+      (nj_u2)(sizeof(tactile_methods) / sizeof(tactile_methods[0])) },
+    { NJ_C_SOFTNOTIF, "java/lang/Object",
+      NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT,
+      NULL, 0u, softnotif_methods,
+      (nj_u2)(sizeof(softnotif_methods) / sizeof(softnotif_methods[0])) },
+    { NJ_C_SNIMPL, NJ_C_SOFTNOTIF, 0u,
+      snimpl_fields,
+      (nj_u2)(sizeof(snimpl_fields) / sizeof(snimpl_fields[0])),
+      snimpl_methods,
+      (nj_u2)(sizeof(snimpl_methods) / sizeof(snimpl_methods[0])) },
+    { NJ_C_SNEXC, "java/lang/Exception", NJ_ACC_PUBLIC,
+      snexc_fields,
+      (nj_u2)(sizeof(snexc_fields) / sizeof(snexc_fields[0])),
+      snexc_methods,
+      (nj_u2)(sizeof(snexc_methods) / sizeof(snexc_methods[0])) },
+    { NJ_C_SNLISTEN, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, snlisten_methods,
+      (nj_u2)(sizeof(snlisten_methods) / sizeof(snlisten_methods[0])) },
+    { NJ_C_JOYLISTEN, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, joylisten_methods,
+      (nj_u2)(sizeof(joylisten_methods) / sizeof(joylisten_methods[0])) },
+    { NJ_C_GESTLISTEN, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, NULL, 0u },
+    { NJ_C_GESTEVENT, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      NULL, 0u, gestevent_methods,
+      (nj_u2)(sizeof(gestevent_methods) / sizeof(gestevent_methods[0])) },
+    { NJ_C_GESTZONE, "java/lang/Object", NJ_ACC_PUBLIC,
+      gestzone_fields,
+      (nj_u2)(sizeof(gestzone_fields) / sizeof(gestzone_fields[0])),
+      gestzone_methods,
+      (nj_u2)(sizeof(gestzone_methods) / sizeof(gestzone_methods[0])) },
+    { NJ_C_GESTMGR, "java/lang/Object", NJ_ACC_PUBLIC | NJ_ACC_FINAL,
+      NULL, 0u, gestmgr_methods,
+      (nj_u2)(sizeof(gestmgr_methods) / sizeof(gestmgr_methods[0])) },
+    { NJ_C_CANVASITEM, "java/lang/Object",
+      NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT,
+      canvasitem_fields,
+      (nj_u2)(sizeof(canvasitem_fields) / sizeof(canvasitem_fields[0])),
+      canvasitem_methods,
+      (nj_u2)(sizeof(canvasitem_methods) / sizeof(canvasitem_methods[0])) },
+    { NJ_C_CANVASGFXITEM, NJ_C_CANVASITEM,
+      NJ_ACC_PUBLIC | NJ_ACC_ABSTRACT,
+      NULL, 0u, canvasgfx_methods,
+      (nj_u2)(sizeof(canvasgfx_methods) / sizeof(canvasgfx_methods[0])) },
+    { NJ_C_TEXTEDITOR, NJ_C_CANVASITEM, NJ_ACC_PUBLIC,
+      texteditor_fields,
+      (nj_u4)(sizeof(texteditor_fields) / sizeof(texteditor_fields[0])),
+      texteditor_methods,
+      (nj_u4)(sizeof(texteditor_methods) / sizeof(texteditor_methods[0])) },
+    { NJ_C_TELISTENER, NULL,
+      NJ_ACC_PUBLIC | NJ_ACC_INTERFACE | NJ_ACC_ABSTRACT,
+      telistener_fields,
+      (nj_u4)(sizeof(telistener_fields) / sizeof(telistener_fields[0])),
+      telistener_methods,
+      (nj_u4)(sizeof(telistener_methods) / sizeof(telistener_methods[0])) },
+    { NULL, NULL, 0u, NULL, 0u, NULL, 0u }
+};
+const int nj_lib_nokia_class_count =
+    (int)(sizeof(nj_lib_nokia_classes) / sizeof(nj_lib_nokia_classes[0])) - 1;
+
+const nj_native_entry nj_lib_nokia_table[] = {
+    { NJ_C_SVIB, "isSupported", "()Z",   svib_is_supported },
+    { NJ_C_SVIB, "start",       "(II)V", svib_start },
+    { NJ_C_SVIB, "stop",        "()V",   svib_stop },
+    { NJ_C_MVIB, "run",                 "()V",    mvib_noop },
+    { NJ_C_MVIB, "setVibrateTone",      "(I)V",   mvib_set_tone },
+    { NJ_C_MVIB, "vibrateFor",          "(I)V",   mvib_periodic_one },
+    { NJ_C_MVIB, "vibratePeriodically", "(I)V",   mvib_periodic_one },
+    { NJ_C_MVIB, "vibratePeriodically", "(II)V",  mvib_periodic_two },
+    { NJ_C_MVIB, "vibratorOff",         "()V",    mvib_noop },
+    { NJ_C_MVIB, "vibratorOn",          "()V",    mvib_noop },
+    { NJ_C_MVIB, "setupVibration",      "(III)V", mvib_setup },
+    { NJ_C_DEVCTL, "setLights",      "(II)V",  nokia_dc_ok },
+    { NJ_C_DEVCTL, "setLights",      "(III)V", nokia_dc_ok },
+    { NJ_C_DEVCTL, "flashLights",    "(I)V",   nokia_dc_ok },
+    { NJ_C_DEVCTL, "vibrate",        "(I)V",   nokia_dc_vibrate },
+    { NJ_C_DEVCTL, "startVibra",     "(IJ)V",  nokia_dc_startVibra },
+    { NJ_C_DEVCTL, "stopVibra",      "()V",    nokia_dc_stopVibra },
+    { NJ_C_DEVCTL, "flashLights",    "(J)V",   nokia_dc_ok },
+    { NJ_C_DEVCTL, "setScreenState", "(Z)V",   nokia_dc_ok },
+    { NJ_C_VKEYBOARD, "hideOpenKeypadCommand", "(Z)V", nokia_vk_hide },
+    { NJ_C_VKEYBOARD, "showOpenKeypadCommand", "(Z)V", nokia_vk_show },
+    { NJ_C_VKEYBOARD, "setVisibility",         "(Z)V", nokia_vk_hide },
+    { NJ_C_VKEYBOARD, "getVisibility",         "()Z",  nokia_vk_visible },
+    { NJ_C_MPTOUCH, "<init>", "()V", nokia_mpt_init },
+    { NJ_C_MPTOUCH, "getInstance", "()L" NJ_C_MPTOUCH ";", nokia_mpt_instance },
+    { NJ_C_MPTOUCH, "addMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";)V", nokia_mpt_add },
+    { NJ_C_MPTOUCH, "removeMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";)V", nokia_mpt_remove },
+    { NJ_C_MPTOUCH, "getState", "(I)I", nokia_mpt_get_state },
+    { NJ_C_MPTOUCH, "getX",     "(I)I", nokia_mpt_get_x },
+    { NJ_C_MPTOUCH, "getY",     "(I)I", nokia_mpt_get_y },
+    { NJ_C_MPTOUCH, "setMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";)V", nokia_mpt_add },
+    { NJ_C_MPTOUCH, "setMultipointTouchListener",
+      "(L" NJ_C_MPLISTEN ";I)V", nokia_mpt_add },
+    { NJ_C_FSELECT, "launch", "(IIZ)[L" NJ_C_FSDETAIL ";",
+      nokia_fselect_launch },
+    { NJ_C_FSDETAIL, "<init>",  "()V", nokia_fsd_init },
+    { NJ_C_SOUND, "<init>",  "(IJ)V", nokia_snd_init },
+    { NJ_C_SOUND, "<init>",  "([BI)V", nokia_snd_init },
+    { NJ_C_SOUND, "init",    "(IJ)V", nokia_snd_init },
+    { NJ_C_SOUND, "init",    "([BI)V", nokia_snd_init },
+    { NJ_C_SOUND, "setSoundListener",
+      "(L" NJ_C_SLISTEN ";)V", nokia_snd_setListener },
+    { NJ_C_SOUND, "play",    "(I)V",  nokia_snd_play },
+    { NJ_C_SOUND, "stop",    "()V",   nokia_snd_stop },
+    { NJ_C_SOUND, "setGain", "(I)V",  nokia_snd_setGain },
+    { NJ_C_SOUND, "getState","()I",   nokia_snd_getState },
+    { NJ_C_SOUND, "resume",   "()V",  nokia_snd_resume },
+    { NJ_C_SOUND, "getGain",  "()I",  nokia_snd_getGain },
+    { NJ_C_SOUND, "getConcurrentSoundCount", "(I)I", nokia_snd_concurrent },
+    { NJ_C_SOUND, "getSupportedFormats",     "()[I", nokia_snd_formats },
+    { NJ_C_SOUND, "convertFreqToNote",       "(I)I", nokia_snd_freq_to_note },
+    { NJ_C_SOUND, "release", "()V",   nokia_snd_stop },
+    { NJ_C_FSDETAIL, "getUrl",  "()Ljava/lang/String;", nokia_fsd_getUrl },
+    { NJ_C_FSDETAIL, "getName", "()Ljava/lang/String;", nokia_fsd_getName },
+    { NJ_C_DUTILS, "createImage", "(II)" NJ_DU_IMAGE_DESC,
+      nokia_du_createImage2 },
+    { NJ_C_DUTILS, "createImage", "(III)" NJ_DU_IMAGE_DESC,
+      nokia_du_createImage3 },
+    { NJ_C_DUTILS, "createImage", "([BII)" NJ_DU_IMAGE_DESC,
+      nokia_du_createImage },
+    { NJ_C_DUTILS, "getDirectGraphics",
+      "(Ljavax/microedition/lcdui/Graphics;)L" NJ_C_DGRAPHICS ";",
+      nokia_du_getDirectGraphics },
+    { NJ_C_CLIPBOARD, "copyToClipboard", "(Ljava/lang/String;)V", nokia_clip_copy },
+    { NJ_C_CLIPBOARD, "copyFromClipboard", "()Ljava/lang/String;", nokia_clip_paste },
+    { NJ_C_GLOBIND, "setGlobalIndicator", "(II)I", nokia_globind_set },
+    { NJ_C_GLOBIND, "getGlobalIndicator", "(I)I",  nokia_globind_get },
+    { NJ_C_GLOBINDEXC, "<init>", "()V",                 nokia_gex_init0 },
+    { NJ_C_GLOBINDEXC, "<init>", "(Ljava/lang/String;)V",   nokia_gex_init_msg },
+    { NJ_C_GLOBINDEXC, "<init>", "(Ljava/lang/String;I)V",  nokia_gex_init_msg_code },
+    { NJ_C_GLOBINDEXC, "getErrorCode", "()I",           nokia_gex_code },
+    { NJ_C_TACTILE, "<init>",                          "()V", nokia_tactile_init },
+    { NJ_C_TACTILE, "directFeedback",                  "(I)V", nokia_tactile_direct },
+    { NJ_C_TACTILE, "isTouchFeedbackSupported",        "()Z", nokia_tactile_supported },
+    { NJ_C_TACTILE, "registerFeedbackArea",            "(Ljava/lang/Object;IIIIII)V",
+      nokia_tactile_register },
+    { NJ_C_TACTILE, "unregisterFeedbackArea",          "(Ljava/lang/Object;I)V",
+      nokia_tactile_unregister },
+    { NJ_C_TACTILE, "removeFeedbackForComponent",      "(Ljava/lang/Object;)V",
+      nokia_tactile_remove },
+    { NJ_C_TACTILE, "moveFeedbackAreaToFirstPriority", "(Ljava/lang/Object;I)V",
+      nokia_tactile_move },
+    { NJ_C_SOFTNOTIF, "newInstance", "(I)L" NJ_C_SOFTNOTIF ";", nokia_sn_new1 },
+    { NJ_C_SOFTNOTIF, "newInstance", "()L" NJ_C_SOFTNOTIF ";",  nokia_sn_new0 },
+    { NJ_C_SNIMPL, "<init>",   "()V",  nokia_sn_init0 },
+    { NJ_C_SNIMPL, "<init>",   "(I)V", nokia_sn_init1 },
+    { NJ_C_SNIMPL, "getId",    "()I",  nokia_sn_getid },
+    { NJ_C_SNIMPL, "post",     "()V",  nokia_sn_post },
+    { NJ_C_SNIMPL, "remove",   "()V",  nokia_sn_remove },
+    { NJ_C_SNIMPL, "setListener", "(L" NJ_C_SNLISTEN ";)V", nokia_sn_setlistener },
+    { NJ_C_SNIMPL, "setText",  "(Ljava/lang/String;Ljava/lang/String;)V",
+      nokia_sn_settext },
+    { NJ_C_SNIMPL, "setSoftkeyLabels", "(Ljava/lang/String;Ljava/lang/String;)V",
+      nokia_sn_setsoftkeys },
+    { NJ_C_SNIMPL, "setImage", "([B)V", nokia_sn_setimage },
+    { NJ_C_SNEXC, "<init>", "()V",                    nokia_snex_init0 },
+    { NJ_C_SNEXC, "<init>", "(Ljava/lang/String;)V",  nokia_snex_init_msg },
+    { NJ_C_SNEXC, "<init>", "(Ljava/lang/String;I)V", nokia_snex_init_msg_code },
+    { NJ_C_SNEXC, "getErrorCode", "()I",              nokia_snex_code },
+    { NJ_C_GESTZONE, "<init>", "(I)V", nokia_gz_init },
+    { NJ_C_GESTZONE, "getType", "()I", nokia_gz_type },
+    { NJ_C_GESTMGR, "register",
+      "(Ljava/lang/Object;L" NJ_C_GESTZONE ";)Z", nokia_gest_register },
+    { NJ_C_GESTMGR, "setListener",
+      "(Ljava/lang/Object;L" NJ_C_GESTLISTEN ";)V", nokia_gest_setlistener },
+    { NJ_C_CANVASITEM, "setParent",    "(Ljava/lang/Object;)V", nokia_ci_set_parent },
+    { NJ_C_CANVASITEM, "getParent",    "()Ljava/lang/Object;",  nokia_ci_get_parent },
+    { NJ_C_CANVASITEM, "setSize",      "(II)V",                 nokia_ci_set_size },
+    { NJ_C_CANVASITEM, "getWidth",     "()I",                   nokia_ci_get_width },
+    { NJ_C_CANVASITEM, "getHeight",    "()I",                   nokia_ci_get_height },
+    { NJ_C_CANVASITEM, "setPosition",  "(II)V",                 nokia_ci_set_position },
+    { NJ_C_CANVASITEM, "getPositionX", "()I",                   nokia_ci_get_position_x },
+    { NJ_C_CANVASITEM, "getPositionY", "()I",                   nokia_ci_get_position_y },
+    { NJ_C_CANVASITEM, "setVisible",   "(Z)V",                  nokia_ci_set_visible },
+    { NJ_C_CANVASITEM, "isVisible",    "()Z",                   nokia_ci_is_visible },
+    { NJ_C_CANVASITEM, "setZPosition", "(I)V",                  nokia_ci_set_z },
+    { NJ_C_CANVASITEM, "getZPosition", "()I",                   nokia_ci_get_z },
+    { NJ_C_CANVASGFXITEM, "<init>",       "(II)V", nokia_cgi_init },
+    { NJ_C_CANVASGFXITEM, "setParent",    "(Ljava/lang/Object;)V",
+      nokia_cgi_set_parent },
+    { NJ_C_CANVASGFXITEM, "setSize",      "(II)V", nokia_cgi_set_size },
+    { NJ_C_CANVASGFXITEM, "repaint",      "()V",   nokia_cgi_repaint },
+    { NJ_C_CANVASGFXITEM, "repaint",      "(IIII)V", nokia_cgi_repaint },
+    { NJ_C_CANVASGFXITEM, "setZPosition", "(I)V", nokia_ci_set_z },
+    { NJ_C_CANVASGFXITEM, "getZPosition", "()I",  nokia_ci_get_z },
+    { NJ_C_CANVASGFXITEM, "_invokePaint", "(L" NJ_C_GRAPHICS ";)V",
+      nokia_cgi_invoke_paint },
+    { NJ_C_TEXTEDITOR, "createTextEditor",
+      "(Ljava/lang/String;IIII)Lcom/nokia/mid/ui/TextEditor;",
+      nokia_te_create1 },
+    { NJ_C_TEXTEDITOR, "createTextEditor", "(IIII)Lcom/nokia/mid/ui/TextEditor;",
+      nokia_te_create2 },
+    { NJ_C_TEXTEDITOR, "<init>", "(Ljava/lang/String;IIIIZ)V", nokia_te_init },
+    { NJ_C_TEXTEDITOR, "setFocus", "(Z)V", nokia_te_set_focus },
+    { NJ_C_TEXTEDITOR, "hasFocus", "()Z", nokia_te_has_focus },
+    { NJ_C_TEXTEDITOR, "setParent", "(Ljava/lang/Object;)V", nokia_cgi_set_parent },
+    { NJ_C_TEXTEDITOR, "setSize", "(II)V", nokia_te_set_size },
+    { NJ_C_TEXTEDITOR, "setSize", "(IIII)V", nokia_te_set_size4 },
+    { NJ_C_TEXTEDITOR, "setPosition", "(II)V", nokia_te_set_position },
+    { NJ_C_TEXTEDITOR, "setVisible", "(Z)V", nokia_te_set_visible },
+    { NJ_C_TEXTEDITOR, "setZPosition", "(I)V", nokia_te_set_z },
+    { NJ_C_TEXTEDITOR, "getZPosition", "()I", nokia_te_get_z },
+    { NJ_C_TEXTEDITOR, "getLineMarginHeight", "()I", nokia_te_line_margin },
+    { NJ_C_TEXTEDITOR, "getContentHeight", "()I", nokia_te_content_height },
+    { NJ_C_TEXTEDITOR, "getHeight", "()I", nokia_te_get_height },
+    { NJ_C_TEXTEDITOR, "getWidth", "()I", nokia_te_get_width },
+    { NJ_C_TEXTEDITOR, "setCaret", "(I)V", nokia_te_set_caret },
+    { NJ_C_TEXTEDITOR, "getCaretPosition", "()I", nokia_te_get_caret },
+    { NJ_C_TEXTEDITOR, "getVisibleContentPosition", "()I", nokia_te_visible_content },
+    { NJ_C_TEXTEDITOR, "getFont", "()L" NJ_C_FONT ";", nokia_te_get_font },
+    { NJ_C_TEXTEDITOR, "setFont", "(L" NJ_C_FONT ";)V", nokia_te_set_font },
+    { NJ_C_TEXTEDITOR, "getBackgroundColor", "()I", nokia_te_get_bg },
+    { NJ_C_TEXTEDITOR, "getForegroundColor", "()I", nokia_te_get_fg },
+    { NJ_C_TEXTEDITOR, "setBackgroundColor", "(I)V", nokia_te_set_bg },
+    { NJ_C_TEXTEDITOR, "setForegroundColor", "(I)V", nokia_te_set_fg },
+    { NJ_C_TEXTEDITOR, "setHighlightBackgroundColor", "(I)V", nokia_te_set_focus_bg },
+    { NJ_C_TEXTEDITOR, "setHighlightForegroundColor", "(I)V", nokia_te_set_focus_fg },
+    { NJ_C_TEXTEDITOR, "setContent", "(Ljava/lang/String;)V", nokia_te_set_content },
+    { NJ_C_TEXTEDITOR, "getContent", "()Ljava/lang/String;", nokia_te_get_content },
+    { NJ_C_TEXTEDITOR, "insert", "(Ljava/lang/String;I)V", nokia_te_insert },
+    { NJ_C_TEXTEDITOR, "delete", "(II)V", nokia_te_delete },
+    { NJ_C_TEXTEDITOR, "getMaxSize", "()I", nokia_te_get_max_size },
+    { NJ_C_TEXTEDITOR, "setMaxSize", "(I)V", nokia_te_set_max_size },
+    { NJ_C_TEXTEDITOR, "size", "()I", nokia_te_size },
+    { NJ_C_TEXTEDITOR, "setConstraints", "(I)V", nokia_te_set_constraints },
+    { NJ_C_TEXTEDITOR, "getConstraints", "()I", nokia_te_get_constraints },
+    { NJ_C_TEXTEDITOR, "setInitialInputMode", "(Ljava/lang/String;)V", nokia_te_set_mode },
+    { NJ_C_TEXTEDITOR, "getInitialInputMode", "()Ljava/lang/String;", nokia_te_get_mode },
+    { NJ_C_TEXTEDITOR, "setSelection", "(II)V", nokia_te_set_selection },
+    { NJ_C_TEXTEDITOR, "getSelection", "()Ljava/lang/String;", nokia_te_get_selection },
+    { NJ_C_TEXTEDITOR, "setTextEditorListener",
+      "(Lcom/nokia/mid/ui/TextEditorListener;)V", nokia_te_set_listener },
+    { NJ_C_TEXTEDITOR, "isMultiline", "()Z", nokia_te_is_multiline },
+    { NJ_C_TEXTEDITOR, "setMultiline", "(Z)V", nokia_te_set_multiline },
+    { NJ_C_TEXTEDITOR, "setIndicatorVisibility", "(Z)V", nokia_te_set_indicator },
+    { NJ_C_TEXTEDITOR, "_invokePaint", "(L" NJ_C_GRAPHICS ";)V", nokia_te_invoke_paint },
+    { NJ_C_TEXTEDITOR, "_contentChanged", "(Ljava/lang/String;)V", nokia_te_content_changed },
+    { NJ_C_TEXTEDITOR, "_inputAction", "(I)V", nokia_te_input_action },
+    { NJ_C_TELISTENER, "inputAction", "(Lcom/nokia/mid/ui/TextEditor;I)V", NULL },
+    { NULL, NULL, NULL, NULL }
+};
+const int nj_lib_nokia_count =
+    (int)(sizeof(nj_lib_nokia_table) / sizeof(nj_lib_nokia_table[0])) - 1;

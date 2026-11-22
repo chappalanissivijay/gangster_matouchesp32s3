@@ -1,0 +1,332 @@
+/*
+ * nano_j2me - nj_codec.h
+ *
+ * ============================================================================
+ *  IMAGE CODEC ADAPTERS
+ * ============================================================================
+ *
+ * Decoding PNG and JPEG in portable C is the right default, but it is rarely
+ * the right answer on a specific board:
+ *
+ *   ESP32-S3   has a hardware JPEG decoder and a PPA that can also scale;
+ *              decoding a 640x480 JPEG into an 8 MB PSRAM buffer in software
+ *              costs ~200 ms, in hardware ~15 ms.
+ *   Android    should hand the bytes to BitmapFactory, which uses the
+ *              platform's own (usually hardware) path.
+ *   A board with a mask ROM codec (many camera-oriented MCUs) should use it.
+ *   A product with a fixed asset pipeline may not want a JPEG decoder linked
+ *              in at all, and would rather get a clear error than 40 KB of
+ *              code it never executes.
+ *
+ * So image decoding goes through a registry of providers.  The runtime ships
+ * software PNG (and optionally software JPEG) as ordinary providers; a port
+ * installs its own ahead of them and wins.  Nothing about the rest of the
+ * runtime changes: MIDP still calls Image.createImage(byte[]) and still gets an
+ * Image back.
+ *
+ * ============================================================================
+ *  WHAT A PROVIDER MUST GUARANTEE
+ * ============================================================================
+ *   - `accepts()` is cheap: it looks at a magic number, nothing else.  It is
+ *     called for every provider on every decode, so it must not scan.
+ *   - `decode()` either returns a fully formed nj_image or NULL.  On NULL it
+ *     MAY set *err to a static string; the runtime copies it into the Java
+ *     exception message.
+ *   - Memory is taken through the request's alloc/dealloc hooks, never
+ *     malloc directly, so teardown stays complete and the Java heap can be
+ *     backed by PSRAM.  `nj_image_free_ex()` releases whatever was handed out.
+ *   - Untrusted input stays untrusted: bounds-check every read.  A provider
+ *     that can be made to write outside its output buffer is a remote code
+ *     execution bug in a game loader, which is exactly the threat model here.
+ *   - A provider must be reentrant and hold no mutable global state, for the
+ *     same reason the rest of the runtime does not.
+ */
+#ifndef NJ_CODEC_H
+#define NJ_CODEC_H
+
+#include "nj_types.h"
+#include "nj_gfx.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+/* ------------------------------------------------------------------ */
+/* Formats                                                             */
+/* ------------------------------------------------------------------ */
+/* Containers a provider can recognise. */
+#define NJ_CODEC_FMT_PNG   0x0001u
+#define NJ_CODEC_FMT_JPEG  0x0002u
+#define NJ_CODEC_FMT_GIF   0x0004u
+#define NJ_CODEC_FMT_BMP   0x0008u
+#define NJ_CODEC_FMT_WBMP  0x0010u
+#define NJ_CODEC_FMT_RAW   0x0020u
+/* WebP: no built-in decoder anywhere in this runtime - it is here so that a
+ * platform provider (Android's BitmapFactory reads it) has a name to report. */
+#define NJ_CODEC_FMT_WEBP  0x0040u
+
+/*
+ * Pixel layouts.
+ *
+ * TWO SPACES, DELIBERATELY:
+ *
+ *   nj_image.format          is an NJ_PIXFMT_* value (nj_config.h) - one
+ *                            layout, the one the image actually uses.
+ *   nj_codec_caps.outputs    is a BITMASK of NJ_CODEC_CAN_*, because a
+ *                            provider may be able to produce several.
+ *
+ * They were separate constants once and that was a bug waiting to happen: a
+ * decoder set nj_image.format to NJ_PIXFMT_ARGB8888 (2) while the caller
+ * compared it against NJ_CODEC_OUT_ARGB8888 (1).  Deriving the bitmask from
+ * the NJ_PIXFMT_* numbering makes the two impossible to confuse.
+ */
+#define NJ_CODEC_CAN(pixfmt)   (1u << (pixfmt))
+#define NJ_CODEC_CAN_RGB565    NJ_CODEC_CAN(NJ_PIXFMT_RGB565)
+#define NJ_CODEC_CAN_RGB888    NJ_CODEC_CAN(NJ_PIXFMT_RGB888)
+#define NJ_CODEC_CAN_ARGB8888  NJ_CODEC_CAN(NJ_PIXFMT_ARGB8888)
+
+/* "Any layout you can produce" for nj_codec_req.out_format. */
+#define NJ_CODEC_OUT_ANY       0xFFFFFFFFu
+
+/* Scale factors a provider can decode at, as a bitmask:
+ * bit 0 = 1/1, bit 1 = 1/2, bit 2 = 1/4, bit 3 = 1/8. */
+#define NJ_CODEC_SCALE_1  (1u << 0)
+#define NJ_CODEC_SCALE_2  (1u << 1)
+#define NJ_CODEC_SCALE_4  (1u << 2)
+#define NJ_CODEC_SCALE_8  (1u << 3)
+
+/* ------------------------------------------------------------------ */
+/* Capabilities                                                        */
+/* ------------------------------------------------------------------ */
+typedef struct nj_codec_caps {
+    nj_u4 formats;      /* NJ_CODEC_FMT_* accepted                        */
+    nj_u4 outputs;      /* NJ_CODEC_OUT_* produced                        */
+    nj_u4 scales;       /* NJ_CODEC_SCALE_* honoured; 0 means 1/1 only   */
+    nj_u4 max_pixels;   /* refuse larger images; 0 = no limit             */
+    int   progressive;  /* handles progressive/interlaced variants        */
+    int   streaming;    /* can decode from a buffer smaller than the file */
+} nj_codec_caps;
+
+/* Header-only probe result. */
+typedef struct nj_image_info {
+    int width;
+    int height;
+    int has_alpha;
+    int bits_per_pixel;   /* per source pixel, 0 if unknown */
+    nj_u4 format;         /* the NJ_CODEC_FMT_* that matched */
+} nj_image_info;
+
+/* ------------------------------------------------------------------ */
+/* Decode request                                                      */
+/* ------------------------------------------------------------------ */
+typedef struct nj_codec_req {
+    const void *data;
+    nj_u4       size;
+
+    /* The VM this decode belongs to.  A provider installed by a port needs it
+     * to reach the platform (nj_vm_port(req->vm) -> port->ud); a provider that
+     * only uses its allocator hooks can ignore it.  NULL for a decode that was
+     * not started by the VM. */
+    struct nj_vm *vm;
+
+    /* Requested geometry.  0 means "native size".  A provider that cannot
+     * scale must either decode natively (and the caller resamples) or refuse;
+     * `want_width`/`want_height` are a HINT, and the returned image's actual
+     * size is always authoritative. */
+    int want_width;
+    int want_height;
+
+    int want_alpha;      /* 1 = alpha must be preserved exactly          */
+    nj_u4 out_format;    /* an NJ_PIXFMT_* value, or NJ_CODEC_OUT_ANY    */
+
+    /* Memory.  A provider MUST use these. */
+    void *(*alloc)(void *ud, nj_size n);
+    void  (*dealloc)(void *ud, void *p);
+    void   *ud;
+
+    /* Optional: the provider may set this to a static description. */
+    const char **err;
+} nj_codec_req;
+
+/* ------------------------------------------------------------------ */
+/* Provider                                                            */
+/* ------------------------------------------------------------------ */
+typedef struct nj_codec {
+    const char *name;         /* "png-software", "jpeg-hw", ... */
+
+    nj_codec_caps caps;   /* a value, so the per-VM copy stays assignable */
+
+    /*
+     * Cheap magic check.  Return 1 when this provider recognises the bytes.
+     * May be NULL, in which case the provider is only used when explicitly
+     * asked for by name.
+     */
+    int (*accepts)(const void *data, nj_u4 size);
+
+    /*
+     * Dimensions and properties without decoding.  Used by
+     * Image.createImage(byte[],off,len) bounds checks and by callers that
+     * want to allocate the destination themselves.  Optional but strongly
+     * recommended: without it, probing a 2000x2000 image decodes it.
+     */
+    nj_status (*info)(const void *data, nj_u4 size, nj_image_info *out);
+
+    /* Decode.  Return NULL on failure. */
+    nj_image *(*decode)(const nj_codec_req *req);
+
+    /* Provider-private context, handed back to the hooks above. */
+    void *ud;
+
+    /*
+     * If non-NULL, the provider needs a per-VM instance and this is called
+     * with `ud` set to a VM-owned copy's private area.  Simple providers
+     * leave it NULL.  It exists so a platform codec can keep per-run state
+     * (a hardware handle) without a global.
+     */
+    nj_status (*attach)(nj_vm *vm, struct nj_codec *self);
+    void      (*detach)(nj_vm *vm, struct nj_codec *self);
+} nj_codec;
+
+/* ------------------------------------------------------------------ */
+/* Registry (owned by the VM - no globals)                             */
+/* ------------------------------------------------------------------ */
+/*
+ * Install a provider.  `priority` orders the registry: higher wins, so a port
+ * passes something above NJ_CODEC_PRIO_BUILTIN to shadow the software
+ * decoders.  The nj_codec struct must outlive the VM (a `const` static, or
+ * memory the port owns); the runtime copies the descriptor but not its
+ * pointed-to members.
+ */
+#define NJ_CODEC_PRIO_FALLBACK  (-100)
+#define NJ_CODEC_PRIO_BUILTIN      0
+#define NJ_CODEC_PRIO_PREFERRED  100
+#define NJ_CODEC_PRIO_PLATFORM   200
+
+nj_status nj_codec_register(nj_vm *vm, const nj_codec *codec, int priority);
+void      nj_codec_unregister(nj_vm *vm, const nj_codec *codec);
+
+/* Find the highest-priority provider that accepts these bytes.
+ * `name` may be non-NULL to require a specific provider. */
+const nj_codec *nj_codec_find(nj_vm *vm, const void *data, nj_u4 size,
+                              const char *name);
+
+/* Number of registered providers, for diagnostics. */
+int nj_codec_count(nj_vm *vm);
+
+/* Name of provider `index`, or NULL. */
+const char *nj_codec_name_at(nj_vm *vm, int index);
+
+/* True when a provider that accepts `data` exists. */
+int nj_codec_available(nj_vm *vm, const void *data, nj_u4 size);
+
+/* ------------------------------------------------------------------ */
+/* Decoding                                                            */
+/* ------------------------------------------------------------------ */
+/*
+ * Decode an image using the registry.  This is what the MIDP layer calls; it
+ * is the entry point that makes a platform codec take effect.
+ *
+ * On failure returns NULL, and when `err` is non-NULL sets it to a static
+ * description suitable for an exception message ("no JPEG decoder on this
+ * platform" rather than a silent NULL).
+ */
+nj_image *nj_image_decode(nj_vm *vm, const nj_codec_req *req,
+                          const char **err);
+
+/* Probe dimensions without decoding.  `name` may select a provider. */
+nj_status nj_image_probe(nj_vm *vm, const void *data, nj_u4 size,
+                         nj_image_info *out, const char *name);
+
+/*
+ * Convenience wrappers on top of nj_image_decode, for the common cases.
+ * They fill in the allocator hooks from the VM.
+ */
+nj_image *nj_image_decode_mem(nj_vm *vm, const void *data, nj_u4 size,
+                              const char **err);
+nj_image *nj_image_decode_scaled(nj_vm *vm, const void *data, nj_u4 size,
+                                 int want_w, int want_h, const char **err);
+
+/* Release an image produced by any provider. */
+void nj_image_release(nj_vm *vm, nj_image *img);
+
+/* ------------------------------------------------------------------ */
+/* Built-in providers                                                  */
+/* ------------------------------------------------------------------ */
+/* The software PNG decoder (src/gfx/nj_png.c).  Always present unless
+ * NJ_ENABLE_PNG is 0. */
+extern const nj_codec nj_codec_png_software;
+
+/*
+ * The software GIF decoder (src/gfx/nj_gif.c), unless NJ_ENABLE_GIF is 0.
+ * MIDP 1.0 required GIF, and a MIDlet whose artwork is GIF usually swallows
+ * the resulting IOException and paints a null Image, so the failure shows up
+ * as a black screen rather than as an error.
+ */
+extern const nj_codec nj_codec_gif_software;
+
+/*
+ * The software baseline JPEG decoder (src/gfx/nj_jpeg.c), when
+ * NJ_ENABLE_JPEG is 1.  Otherwise this is a stub whose accepts() returns 0,
+ * so a JPEG simply reports "no decoder" instead of being mis-detected.
+ */
+extern const nj_codec nj_codec_jpeg_software;
+
+/*
+ * The GIF decode entry point (src/gfx/nj_gif.c).  Declared here because the
+ * provider descriptor is built from it and a codec test drives it directly,
+ * without a VM.
+ */
+nj_image *nj_gif_decode(const void *data, nj_u4 size,
+                        void *(*alloc)(void *ud, nj_size n), void *ud,
+                        void (*dealloc)(void *ud, void *p), const char **err);
+
+/*
+ * The three entry points a software JPEG provider implements
+ * (src/gfx/nj_jpeg.c).  Declared here because nj_codec.c builds the descriptor
+ * from them and a provider's own tests need them too.
+ */
+int       nj_jpeg_accepts(const void *data, nj_u4 size);
+nj_status nj_jpeg_info(const void *data, nj_u4 size, nj_image_info *out);
+nj_image *nj_jpeg_decode(const nj_codec_req *req);
+
+/* A provider that recognises JPEG and always fails with a clear message.
+ * Registered at the lowest priority so that Image.createImage of a JPEG on a
+ * build without any JPEG decoder explains itself. */
+extern const nj_codec nj_codec_jpeg_unavailable;
+
+/* The same idea for the other containers this runtime can be built without,
+ * plus BMP, which has no built-in decoder in any configuration.  Each one
+ * sniffs its own magic and fails with a sentence that names the format, so a
+ * build with the decoder cut out says "no PNG decoder in this build" instead
+ * of "unrecognised image format" - and a platform provider registered at
+ * NJ_CODEC_PRIO_PLATFORM shadows it. */
+extern const nj_codec nj_codec_png_unavailable;
+extern const nj_codec nj_codec_gif_unavailable;
+extern const nj_codec nj_codec_bmp_unavailable;
+
+/* Install the built-in providers into a VM.  Called by nj_vm_create(). */
+void nj_codecs_register_builtins(nj_vm *vm);
+
+/* ------------------------------------------------------------------ */
+/* Helpers for writing a provider                                      */
+/* ------------------------------------------------------------------ */
+/*
+ * Allocate a blank image through the request's hooks.
+ * `pixfmt` is a NJ_PIXFMT_* value and becomes nj_image.format.
+ */
+nj_image *nj_codec_image_new(const nj_codec_req *req, int w, int h,
+                             int pixfmt, int has_alpha);
+
+/* Bytes per pixel for an NJ_PIXFMT_* value. */
+nj_u4 nj_codec_pixel_bytes(int pixfmt);
+
+/* The best layout to hand a provider given what it can do and what the
+ * display wants.  Returns an NJ_PIXFMT_* value. */
+int nj_codec_pick_format(nj_u4 can_produce, int display_format);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NJ_CODEC_H */

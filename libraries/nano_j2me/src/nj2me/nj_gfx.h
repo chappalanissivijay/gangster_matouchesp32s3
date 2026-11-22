@@ -1,0 +1,516 @@
+/*
+ * nano_j2me - nj_gfx.h
+ *
+ * Software rasterizer.  Everything MIDP Graphics needs, implemented over a
+ * plain linear pixel buffer, with a translate + clip state exactly like
+ * javax.microedition.lcdui.Graphics. Optional nj_gfx_accel callbacks may perform
+ * synchronous 2D operations; the software implementation is always retained.
+ *
+ * Pixel formats: NJ_PIXFMT_RGB565 (default, embedded panels),
+ *                NJ_PIXFMT_RGB888, NJ_PIXFMT_ARGB8888.
+ *
+ * All drawing honours: color (ARGB8888 with alpha), translate, clip,
+ * blend mode (SRC_OVER / NONE) and the stroke style for drawRect/drawArc/
+ * drawRoundRect.
+ */
+#ifndef NJ_GFX_H
+#define NJ_GFX_H
+
+#include "nj_types.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Surface                                                             */
+/* ------------------------------------------------------------------ */
+typedef struct nj_surface {
+    void *pixels;     /* linear buffer, stride bytes per row */
+    int   width;
+    int   height;
+    int   stride;     /* bytes per row; may be != width*bpp */
+    int   format;     /* NJ_PIXFMT_* */
+    int   bpp;        /* bytes per pixel, cached */
+} nj_surface;
+
+/* Optional synchronous opaque rectangle fill. Coordinates are clipped to the
+ * surface; packed_color already uses its pixel format. Return nonzero only
+ * after completing all writes. Return zero without writing to use the CPU
+ * fallback. The callback must not enter the VM or retain the borrowed surface. */
+typedef int (*nj_gfx_fill_fn)(void *ud, const nj_surface *surface,
+                             int x, int y, int w, int h, nj_u4 packed_color);
+
+/* ------------------------------------------------------------------ */
+/* Stroke / blend styles                                               */
+/* ------------------------------------------------------------------ */
+#define NJ_STROKE_SOLID  0
+#define NJ_STROKE_DOTTED 1
+
+#define NJ_BLEND_NONE    0   /* opaque copy  */
+#define NJ_BLEND_SRC_OVER 1  /* alpha blend  */
+
+/* ------------------------------------------------------------------ */
+/* Font                                                                */
+/* ------------------------------------------------------------------ */
+/*
+ * A bitmap font.  Fixed-table glyphs are 1 bit per pixel by default:
+ * row-major, MSB first, one byte per 8 horizontal pixels,
+ * row_bytes = (glyph_w + 7) / 8.  When a build selects an antialiased fixed
+ * table (bitmap_coverage == 2, the desktop CMake default) the rows instead
+ * pack four 2-bit coverage samples per byte, MSB first, values 0..3 mapping
+ * to 0, 85, 170, 255, and row_bytes = (glyph_w * 2 + 7) / 8.  Either way the
+ * advance stays exactly one cell, so line layout is identical.
+ *
+ * `glyph_lookup` optionally overrides the fixed-pitch bitmap for characters
+ * outside [first_char, last_char] - this is how the CJK provider hooks in.
+ */
+typedef struct nj_font {
+    const char *name;
+    int   height;        /* line height = ascent + descent (+ leading) */
+    int   ascent;
+    int   descent;
+    int   leading;
+    int   style;         /* NJ_FONT_STYLE_*  */
+    int   size;          /* NJ_FONT_SIZE_*   */
+    int   proportional;
+    nj_u2 first_char;
+    nj_u2 last_char;
+    int   glyph_w;       /* fixed cell width  */
+    int   glyph_h;
+    const nj_u1 *bitmap; /* (last-first+1) * glyph_h * row_bytes */
+    /* Coverage of `bitmap` rows: 0 = 1bpp, 2 = packed 2bpp. */
+    int   bitmap_coverage;
+
+    /*
+     * Optional glyph provider, for anything the fixed table cannot hold: a wide
+     * face, a CJK font, or a TrueType face rasterised on demand.
+     *
+     * With coverage=0, provider rows are 1bpp, MSB first, (w+7)/8 bytes.
+     * coverage=1 uses one coverage byte (0..255) per pixel. coverage=2 packs
+     * four 2-bit samples per byte, MSB first, (w+3)/4 bytes per row; values
+     * 0..3 map to 0, 85, 170, 255. The fixed bitmap table uses its own
+     * `bitmap_coverage` field, not this provider field.
+     * The renderer blends coverage because thresholding an
+     * antialiased rasteriser deletes thin strokes: a hinted-away stem is two
+     * columns at about 50%, and a 1bpp cut through it loses the stem entirely
+     * from "1", "l", "i" and "t".
+     */
+    const nj_u1 *(*glyph_lookup)(void *ud, nj_u2 ch, int *w, int *h);
+    int   coverage;      /* 0 = 1bpp rows, 1 = 8bpp, 2 = packed 2bpp coverage */
+    void *glyph_ud;
+    /* Optional advance metric override (proportional wide glyphs). */
+    int (*glyph_advance)(void *ud, nj_u2 ch);
+
+    /* Font consulted for characters outside [first_char, last_char] and for
+     * glyphs the fixed cell cannot represent (CJK).  Chainable: the fallback
+     * may itself have a fallback.  NULL = no fallback. */
+    const struct nj_font *fallback;
+    /* Baseline row of glyph_lookup cells; 0 uses ascent. Fixed bitmaps always
+     * use ascent. Allows wide cells to preserve descenders without changing
+     * the MIDP line height or the baseline of Latin text. */
+    int   glyph_ascent;
+} nj_font;
+
+#define NJ_FONT_STYLE_PLAIN  0
+#define NJ_FONT_STYLE_BOLD   1
+#define NJ_FONT_STYLE_ITALIC 2
+#define NJ_FONT_STYLE_UNDERLINED 4
+
+#define NJ_FONT_SIZE_SMALL   8
+#define NJ_FONT_SIZE_MEDIUM  0
+#define NJ_FONT_SIZE_LARGE   16
+
+/*
+ * Font registry.
+ *
+ * The runtime holds no mutable global font state, so the *caller* (the VM)
+ * owns an nj_fontset.  It contains mutable nj_font instances built from the
+ * immutable bitmap tables in .rodata; the fallback pointer can therefore be
+ * installed per-instance without touching shared data.
+ *
+ *   nj_fontset fs;
+ *   nj_fontset_init(&fs);
+ *   nj_fontset_set_fallback(&fs, my_cjk_font);
+ *   const nj_font *f = nj_fontset_get(&fs, NJ_FONT_SIZE_MEDIUM, NJ_FONT_STYLE_PLAIN);
+ */
+/*
+ * The variants each size has in a font set: plain and bold, and nothing else.
+ * A MIDP font also has ITALIC and UNDERLINED, but those are synthesised by the
+ * renderer, so they do not get a slot of their own.
+ *
+ * This is the stride of the slot array, which makes it the one number
+ * nj_fontset_get() has to agree on with everything that fills the slots
+ * (nj_font_ttf.c).  Two files computing a slot index from a private copy of it
+ * is a bug waiting for the day one copy changes: the writer and the reader
+ * would disagree about which face a size maps to, and the wrong font would be
+ * handed out with no error anywhere.
+ */
+#define NJ_FONT_SLOT_STYLES 2
+
+#define NJ_FONTSET_SLOTS (3 * NJ_FONT_SLOT_STYLES)
+
+typedef struct nj_fontset {
+    nj_font fonts[NJ_FONTSET_SLOTS];
+    int     initialized;
+    int     count;
+} nj_fontset;
+
+void          nj_fontset_init(nj_fontset *fs);
+const nj_font *nj_fontset_get(nj_fontset *fs, int size, int style);
+void          nj_fontset_set_fallback(nj_fontset *fs, const nj_font *fb);
+
+/*
+ * Install a fallback per slot, for a port whose glyphs live outside the
+ * runtime: the platform's text API, a system font, a server.
+ *
+ * `fonts` is indexed by size_index(size) * NJ_FONT_SLOT_STYLES + bold, so the
+ * caller can give the large face a bigger provider cell than the small one -
+ * one shared fallback cannot, because it is never told which size asked.
+ * A NULL entry leaves that slot alone, and a count below NJ_FONTSET_SLOTS
+ * only fills the first `count` slots.
+ *
+ * Install this before any TrueType face: nj_fontset_use_ttf() rebuilds the
+ * slots and gives each one its own fallback chain.
+ */
+void          nj_fontset_set_fallback_slots(nj_fontset *fs,
+                                            const nj_font *const *fonts,
+                                            int count);
+
+/*
+ * Install the port's faces as the slots themselves, rather than behind them.
+ *
+ * A fallback only answers for characters the built-in cell cannot draw.  A
+ * platform that draws Latin better than the bundled bitmap can - and should
+ * draw every character - needs to be the slot: same indexing, same NULL and
+ * count rules, but the built-in face of that slot is replaced, so both the
+ * advances and the ink come from the port.
+ *
+ * The slot keeps whatever fallback it already had, so a face installed here
+ * can still leave a chain behind it.  The face's own metrics - height, ascent,
+ * descent - become the slot's, so install before the MIDlet builds a screen.
+ */
+void          nj_fontset_set_primary_slots(nj_fontset *fs,
+                                           const nj_font *const *fonts,
+                                           int count);
+
+/* The immutable bitmap table behind a given (size, style) pair.  Exposed so a
+ * port can build its own nj_font if it wants a different registry lifetime.
+ * Never NULL. */
+const nj_font *nj_font_builtin(int size, int style);
+
+/*
+ * Render through a TrueType face.
+ *
+ * `data`/`len` is the whole font file and must stay valid for as long as the
+ * font set uses it - the faces borrow it and do not copy it, so a caller
+ * holding the file in a heap block must keep that block alive.  `alloc`
+ * supplies each face's memory including its glyph cache; the emulator passes
+ * the VM's host allocator, so every block is released by nj_vm_destroy() and
+ * nothing here needs a matching teardown.  Two emulator instances in one
+ * process see nothing of each other's faces.
+ *
+ * Every (size, style) slot is rebuilt.  Metrics come from the bitmap face each
+ * slot replaces rather than from the font, because MIDlet layout is written
+ * against Font.getHeight(): a drop-in face reporting a different line height
+ * would silently re-flow every screen.  The bitmap face stays as the fallback,
+ * so a character the supplied font has no glyph for still renders.
+ *
+ * Returns the number of slots rebuilt (NJ_FONTSET_SLOTS on success), or 0 if
+ * the font cannot be parsed or an allocation fails.  On 0 the font set is left
+ * exactly as it was - a partly upgraded font set is a state no caller can
+ * reason about, and a corrupt file should not be able to produce one.  A build
+ * with NJ_ENABLE_TTF=0 always returns 0 and keeps its bitmap faces.
+ */
+typedef void *(*nj_font_alloc_fn)(void *ud, nj_size n);
+
+#ifdef NJ_GFX_2D_STATS
+/*
+ * Development-only classification of 2D drawing after a deferred M3G batch
+ * (see src/gfx/nj_gfx.c).  Compiled only with -DNJ_GFX_2D_STATS and switched
+ * on by the NJ_GFX_2D_STATS environment variable; used to estimate the
+ * capture/fallback split of a whole-frame GPU renderer.  Never enabled in
+ * release builds.
+ */
+enum {
+    NJ2D_CLEAR, NJ2D_PIXEL, NJ2D_LINE, NJ2D_RECT, NJ2D_FILL,
+    NJ2D_ROUND, NJ2D_FILL_ROUND, NJ2D_ARC, NJ2D_FILL_ARC, NJ2D_TRI,
+    NJ2D_IMAGE, NJ2D_IMAGE_ROP, NJ2D_RGB, NJ2D_TEXT, NJ2D_CHAR,
+    NJ2D_KIND_COUNT
+};
+void nj_gfx_2d_stats_start_interval(int journal_pending);
+void nj_gfx_2d_note_op(int kind, int capturable);
+#endif
+
+int nj_fontset_use_ttf(nj_fontset *fs, const nj_u1 *data, nj_u4 len,
+                       nj_font_alloc_fn alloc, void *ud);
+
+/* Metrics. */
+int nj_font_char_width(const nj_font *f, nj_u2 ch);
+int nj_font_string_width(const nj_font *f, const nj_u2 *s, int len);
+int nj_font_chars_that_fit(const nj_font *f, const nj_u2 *s, int len, int avail);
+
+/* ------------------------------------------------------------------ */
+/* Graphics state                                                      */
+/* ------------------------------------------------------------------ */
+struct nj_gfx_accel;
+
+typedef struct nj_gfx {
+    nj_surface *surf;
+    nj_u4 color;       /* current color, 0xAARRGGBB */
+    int   translate_x;
+    int   translate_y;
+    int   clip_x, clip_y, clip_w, clip_h;  /* in surface space */
+    int   stroke;
+    int   blend;
+    const nj_font *font;
+    nj_u4 xor_color;   /* setXORMode target */
+    int   use_xor;
+    nj_gfx_fill_fn fill_rect;
+    void *fill_ud;
+#if NJ_ENABLE_GFX_ACCEL
+    const struct nj_gfx_accel *accel;
+    void *accel_ud;
+#endif
+} nj_gfx;
+
+/* Per-context backend; NULL or an unknown version selects software. With
+ * NJ_ENABLE_GFX_ACCEL=0 this is a no-op and nj_gfx has no backend fields. */
+void nj_gfx_set_accel(nj_gfx *g, const struct nj_gfx_accel *backend, void *ud);
+
+/* Initialize `g` for `surf`; clip becomes the whole surface, color black,
+ * font = MEDIUM PLAIN. */
+void nj_gfx_init(nj_gfx *g, nj_surface *surf);
+
+/* Coordinate helpers: user -> device. */
+int nj_gfx_dev_x(const nj_gfx *g, int x);
+int nj_gfx_dev_y(const nj_gfx *g, int y);
+
+/* ------------------------------------------------------------------ */
+/* Clipping / transform                                                */
+/* ------------------------------------------------------------------ */
+void nj_gfx_set_clip(nj_gfx *g, int x, int y, int w, int h);
+void nj_gfx_clip_rect(nj_gfx *g, int x, int y, int w, int h);
+void nj_gfx_translate(nj_gfx *g, int dx, int dy);
+void nj_gfx_get_translate(const nj_gfx *g, int *dx, int *dy);
+int  nj_gfx_get_clip_x(const nj_gfx *g);
+int  nj_gfx_get_clip_y(const nj_gfx *g);
+int  nj_gfx_get_clip_w(const nj_gfx *g);
+int  nj_gfx_get_clip_h(const nj_gfx *g);
+
+/* ------------------------------------------------------------------ */
+/* Color / style                                                       */
+/* ------------------------------------------------------------------ */
+void nj_gfx_set_color(nj_gfx *g, nj_u4 argb);
+nj_u4 nj_gfx_get_color(const nj_gfx *g);
+void nj_gfx_set_color_rgb(nj_gfx *g, int r, int g_, int b);
+void nj_gfx_set_alpha(nj_gfx *g, int alpha0_255);
+int  nj_gfx_get_alpha(const nj_gfx *g);
+void nj_gfx_set_blend(nj_gfx *g, int mode);
+void nj_gfx_set_stroke(nj_gfx *g, int stroke);
+void nj_gfx_set_font(nj_gfx *g, const nj_font *f);
+void nj_gfx_set_xor(nj_gfx *g, nj_u4 argb);
+void nj_gfx_clear_xor(nj_gfx *g);
+
+/* ------------------------------------------------------------------ */
+/* Drawing                                                             */
+/* ------------------------------------------------------------------ */
+void nj_gfx_clear(nj_gfx *g, nj_u4 argb);
+void nj_gfx_pixel(nj_gfx *g, int x, int y);
+void nj_gfx_line(nj_gfx *g, int x1, int y1, int x2, int y2);
+void nj_gfx_rect(nj_gfx *g, int x, int y, int w, int h);           /* outline */
+void nj_gfx_fill_rect(nj_gfx *g, int x, int y, int w, int h);
+void nj_gfx_round_rect(nj_gfx *g, int x, int y, int w, int h, int rw, int rh);
+void nj_gfx_fill_round_rect(nj_gfx *g, int x, int y, int w, int h, int rw, int rh);
+void nj_gfx_arc(nj_gfx *g, int x, int y, int w, int h, int start, int extent);
+void nj_gfx_fill_arc(nj_gfx *g, int x, int y, int w, int h, int start, int extent);
+void nj_gfx_triangle(nj_gfx *g, int x1, int y1, int x2, int y2, int x3, int y3, int filled);
+
+/* Text.  `s` is UTF-16. */
+void nj_gfx_draw_text(nj_gfx *g, const nj_u2 *s, int len, int x, int y, int anchor);
+void nj_gfx_draw_char(nj_gfx *g, nj_u2 ch, int x, int y);
+
+/* ------------------------------------------------------------------ */
+/* Images / blitting                                                   */
+/* ------------------------------------------------------------------ */
+/*
+ * An image is a PACKED byte buffer with optional per-pixel alpha.
+ *
+ *   format      an NJ_PIXFMT_* value -- NOT an NJ_CODEC_CAN() capability
+ *               bitmask.  RGB565 = 2 bytes/pixel, RGB888 = 3, ARGB8888 = 4;
+ *               the row pitch is exactly width * bytes-per-pixel.
+ *   pixels      the first pixel; the layout above is what
+ *               nj_codec_image_new() allocates (w * h * bpp bytes), so a
+ *               decoder may hand over a half-size RGB565 frame instead of
+ *               expanding it to ARGB8888 first.
+ *   has_alpha   1 when ARGB8888 alpha values in the data vary; RGB565 and
+ *               RGB888 have no alpha channel and always blit as opaque.
+ *
+ * Transparent ARGB8888 pixels leave the destination untouched (ROP PAINT) and
+ * partially transparent ones are composited; see nj_gfx_draw_image_rop().
+ */
+typedef struct nj_image {
+    int   width;
+    int   height;
+    int   format;      /* NJ_PIXFMT_* : packed layout, see above */
+    nj_u4 *pixels;     /* row-major, bpp bytes per pixel, stride == width */
+    int   has_alpha;
+} nj_image;
+
+void nj_gfx_draw_image(nj_gfx *g, const nj_image *img,
+                       int dx, int dy, int sx, int sy, int sw, int sh);
+void nj_gfx_draw_image_rop(nj_gfx *g, const nj_image *img, int dx, int dy,
+                           int sx, int sy, int sw, int sh, int rop,
+                           int transform);
+void nj_gfx_draw_rgb(nj_gfx *g, const nj_u1 *rgb, int scanlen, int alpha,
+                     int dx, int dy, int sx, int sy, int sw, int sh,
+                     int rop, int transform);
+void nj_gfx_draw_region(nj_gfx *g, const nj_image *src,
+                        int sx, int sy, int sw, int sh,
+                        int transform, int is_xor, nj_u4 xor_argb,
+                        const nj_image *clip_src,
+                        int dx, int dy, int rop);
+
+/* ------------------------------------------------------------------ */
+/* Optional synchronous 2D backend (no GL/Vulkan types or dependencies) */
+/* ------------------------------------------------------------------ */
+#define NJ_GFX_ACCEL_VERSION 1u
+#define NJ_GFX_ACCEL_DONE    1
+#define NJ_GFX_ACCEL_DECLINE 0
+
+/* Borrowed source and mask; byte layouts match nj_image. Source stride is in
+ * bytes, mask rows contain mask_width ARGB8888 words. dx/dy are USER space;
+ * clip_* is the final nonempty DEVICE rectangle, after transform and clipping.
+ * Image entry points clamp source bounds; raw drawRGB buffer validity remains
+ * the caller's responsibility. The surface, source and mask remain
+ * authoritative CPU memory: a pointer is not a texture cache ID.
+ * rop preserves NJ_ROP_OPAQUE; alpha is global weight in [0,255]. */
+typedef struct nj_gfx_blit {
+    const nj_u1 *pixels;
+    nj_s8 stride;
+    int format;
+    const nj_u1 *mask;
+    int mask_width, mask_height;
+    int sx, sy, width, height;
+    int transform, rop;
+    int xor_enabled;
+    nj_u4 xor_color;
+    int dx, dy, alpha;
+    int clip_x, clip_y, clip_w, clip_h;
+} nj_gfx_blit;
+
+/* Return DONE only after the entire operation is complete in CPU pixels,
+ * with exactly the software renderer's clipping, alpha, ROP, transform, XOR
+ * and pixel-format semantics. Any other return declines the operation and
+ * MUST leave all CPU pixels unchanged with no pending writes. Unsupported
+ * formats/features and lost contexts should decline BEFORE writing. GPU work
+ * may use a private target and commit after a successful wait/readback.
+ *
+ * All arguments are borrowed until return. Do not retain them, call the VM,
+ * or recursively invoke the backend. State and resources belong to the port;
+ * synchronize and release them before freeing source/target memory. Fields
+ * may be NULL independently. No asynchronous GPU-resident surface is implied.
+ * fill_rect receives an already-clipped DEVICE rectangle and the complete
+ * color/blend/XOR state in g. blit covers image/region/drawRGB operations.
+ * Software primitives and the old opaque fill callback remain available. */
+typedef struct nj_gfx_accel {
+    nj_u4 version;
+    int (*fill_rect)(void *ud, const nj_gfx *g, int x, int y, int w, int h);
+    int (*blit)(void *ud, const nj_gfx *g, const nj_gfx_blit *blit);
+} nj_gfx_accel;
+
+/* Reference execution of a callback's blit, with ALL acceleration disabled.
+ * Useful for conformance tests and a backend's own software implementation.
+ * Only pass the unmodified descriptor/state received by the blit callback. */
+void nj_gfx_blit_software(const nj_gfx *g, const nj_gfx_blit *blit);
+
+/* Alpha-blended fill of an arbitrary region with coverage 0..255. */
+void nj_gfx_blend_pixel(nj_surface *s, int x, int y, nj_u4 argb, int alpha);
+
+/*
+ * Draw one pixel at user coordinates (x, y) with `coverage` (0..255),
+ * respecting translation and the clip.  Coverage fonts use this; 255 takes the
+ * ordinary opaque path so a bitmap face is unaffected.
+ */
+void nj_gfx_blend_coverage(nj_gfx *g, int x, int y, int coverage);
+
+/* ------------------------------------------------------------------ */
+/* Surface helpers                                                     */
+/* ------------------------------------------------------------------ */
+void  nj_surface_fill(nj_surface *s, nj_u4 argb);
+nj_u4 nj_surface_get(const nj_surface *s, int x, int y);
+void  nj_surface_set(nj_surface *s, int x, int y, nj_u4 argb);
+nj_u4 nj_surface_format_color(int format, nj_u4 argb);
+
+/* ------------------------------------------------------------------ */
+/* Anchor constants (mirror javax.microedition.lcdui.Graphics)         */
+/* ------------------------------------------------------------------ */
+/*
+ * These are the MIDP 2.0 Graphics anchor values, and they are deliberately the
+ * same numbers the Java constants carry: a MIDlet's anchor travels from
+ * Graphics.LEFT through the native call straight into nj_gfx, so any other
+ * numbering here would silently re-interpret it (LEFT meaning HCENTER, say)
+ * rather than fail.  Keep them in step with the seeds in nj_lib_lcdui.c and
+ * with tools/midp_stubs.py, which javac inlines into the MIDlet.
+ *
+ * HOW WE KNOW.  javac inlines `static final int` constants into the caller, so
+ * every compiled MIDlet carries MIDP's real numbers.  Scanning 12476 classes
+ * from the 395 titles in tests/games/ and collecting the constant that precedes
+ * every drawString/drawImage/drawRegion call gives:
+ *
+ *     20  x11342   TOP|LEFT        the canonical text anchor
+ *      0  x 8640   "identical to TOP|LEFT" per the javadoc
+ *     17  x 4569   TOP|HCENTER
+ *      3  x 2482   HCENTER|VCENTER (images)
+ *     36  x 1506   BOTTOM|LEFT
+ *     33  x 1361   BOTTOM|HCENTER
+ *     40  x  859   BOTTOM|RIGHT   (soft-key labels)
+ *     24  x  772   TOP|RIGHT
+ *     68  x   19   BASELINE|LEFT
+ *
+ * Every one of those is a legal, sensible MIDP anchor under this numbering and
+ * several are illegal under the one that reads LEFT as 1: 20 would then be
+ * RIGHT|VCENTER, which MIDP forbids for text, yet it is the commonest anchor in
+ * the whole corpus.  So HCENTER is 1, VCENTER is 2, LEFT is 4, TOP is 16.
+ *
+ * A commit once "corrected" these to LEFT 1 / HCENTER 2 / RIGHT 4 / TOP 8 and
+ * added a translation at the MIDP boundary to compensate.  Both halves were
+ * wrong and the translation could not save it: MIDlets inlined the real values
+ * while the validator rejected them (anchor 3 became LEFT|HCENTER,
+ * "contradictory"), so titles died with IllegalArgumentException instead of
+ * drawing.  This numbering is the contract; do not "fix" it again without
+ * re-running that scan.
+ *
+ * NOTE for callers: nj_gfx treats "no vertical bit set" as BASELINE, because a
+ * text blitter needs some default.  MIDP instead defines a missing vertical
+ * component as TOP, so the MIDP layer spells TOP out explicitly -- see
+ * midp_anchor() in src/midp/nj_lib_lcdui.c.
+ */
+#define NJ_ANCHOR_HCENTER 1
+#define NJ_ANCHOR_VCENTER 2
+#define NJ_ANCHOR_LEFT    4
+#define NJ_ANCHOR_RIGHT   8
+#define NJ_ANCHOR_TOP     16
+#define NJ_ANCHOR_BOTTOM  32
+
+/* ROP constants. OPAQUE paints as if every source alpha were 255, while
+ * retaining the global alpha, clip, mask and XOR rules of PAINT. */
+#define NJ_ROP_SET   0
+#define NJ_ROP_PAINT 1
+#define NJ_ROP_OPAQUE 2
+
+/* Sprite transforms, mirroring javax.microedition.lcdui.game.Sprite. */
+#define NJ_TRANS_NONE 0
+#define NJ_TRANS_ROT90 5
+#define NJ_TRANS_ROT180 3
+#define NJ_TRANS_ROT270 6
+#define NJ_TRANS_MIRROR 2
+#define NJ_TRANS_MIRROR_ROT90 7
+#define NJ_TRANS_MIRROR_ROT180 1
+#define NJ_TRANS_MIRROR_ROT270 4
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NJ_GFX_H */

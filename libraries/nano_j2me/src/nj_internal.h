@@ -1,0 +1,1664 @@
+/*
+ * nano_j2me - nj_internal.h
+ *
+ * Internal data structures of the virtual machine: classes, members, the
+ * global constant-pool resolution cache, heap, threads and frames.
+ *
+ * Nothing in here is part of the public API.  The class library and the ports
+ * talk to the VM through <nj2me/nj_vm.h>.
+ */
+#ifndef NJ_INTERNAL_H
+#define NJ_INTERNAL_H
+
+#include "nj2me/nj_config.h"
+#include "nj2me/nj_types.h"
+#include "nj2me/nj_vm.h"
+#include "nj2me/nj_app.h"
+#include "nj2me/nj_zip.h"
+#include "nj2me/nj_gfx.h"
+#include "nj2me/nj_codec.h"
+#include "nj2me/nj_avcodec.h"
+#include "nj2me/nj_device.h"
+
+#if NJ_ENABLE_ENGINE
+/*
+ * The pluggable execution-engine contract (install/uninstall API, plus the
+ * struct nj_vm::engine field below).  Self-contained; see docs/JIT.md.
+ */
+#include "nj_engine.h"
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Member resolution kinds (constant-pool cache entries)               */
+/* ------------------------------------------------------------------ */
+#define NJ_LINK_NONE        0
+#define NJ_LINK_FIELD_STATIC 1
+#define NJ_LINK_FIELD_INST   2
+#define NJ_LINK_METHOD_STATIC 3  /* invokestatic: call `target` directly    */
+#define NJ_LINK_METHOD_INST   4  /* instance method: invokespecial calls    */
+                                 /* `target` directly, invokevirtual and    */
+                                 /* invokeinterface dispatch through the    */
+                                 /* inline cache (recv_cls/ic_target).      */
+#define NJ_LINK_STRING      7
+#define NJ_LINK_CLASS       8
+
+/* ------------------------------------------------------------------ */
+/* Field                                                               */
+/* ------------------------------------------------------------------ */
+struct nj_field {
+    const char *name;
+    const char *desc;
+    nj_class   *owner;
+    nj_u2       flags;
+    nj_u2       offset;   /* instance byte offset, or static slot index */
+    nj_u2       const_cp; /* ConstantValue attribute CP index, 0 = none */
+    nj_u1       ptype;    /* nj_ptype                                   */
+    nj_u1       width;    /* slots: 1 or 2 (long/double)                */
+};
+
+/* ------------------------------------------------------------------ */
+/* Exception handler table entry                                       */
+/* ------------------------------------------------------------------ */
+typedef struct nj_handler {
+    nj_u2 start_pc;
+    nj_u2 end_pc;
+    nj_u2 handler_pc;
+    nj_u2 catch_cp;   /* 0 == catch-all (finally) */
+} nj_handler;
+
+/* ------------------------------------------------------------------ */
+/* Method                                                              */
+/* ------------------------------------------------------------------ */
+struct nj_method {
+    const char   *name;
+    const char   *desc;
+    nj_class     *owner;
+    const nj_u1  *code;
+    nj_u4         code_len;
+    const nj_handler *handlers;
+    nj_u2         handler_count;
+    nj_u2         flags;
+    nj_u2         max_stack;
+    nj_u2         max_locals;
+    nj_u2         arg_slots; /* argument slots, excluding `this`   */
+    nj_u1         ret_ptype; /* nj_ptype of the return value       */
+    nj_native_fn  native;    /* bound implementation for ACC_NATIVE */
+};
+
+/* ------------------------------------------------------------------ */
+/* Constant pool resolution cache (global, open-addressed)             */
+/* ------------------------------------------------------------------ */
+/*
+ * There is deliberately no global vtable.  Each constant-pool entry that has
+ * been resolved once becomes an INLINE CACHE:
+ *
+ *     target      - the statically resolved member (invokespecial/static/field)
+ *     recv_cls    - receiver class observed last time (virtual dispatch)
+ *     ic_target   - the method that class answered with
+ *
+ * Real MIDlets are overwhelmingly monomorphic (one concrete receiver type per
+ * call site), so `recv->cls == recv_cls` hits almost every time and dispatch
+ * costs one pointer compare instead of a hierarchy walk.  This trades a
+ * handful of bytes per call site for the megabytes a per-class vtable array
+ * would need on a 512 KB microcontroller.
+ */
+typedef struct nj_cpentry {
+    nj_class *cls;       /* key: declaring class                      */
+    nj_u4     cp_index;  /* key: constant pool index                  */
+    void     *target;    /* nj_method* or nj_field*                   */
+    nj_class *recv_cls;  /* inline-cache: last receiver class         */
+    void     *ic_target; /* inline-cache: nj_method* for recv_cls     */
+    nj_u2     slot;      /* field byte offset or static slot index    */
+    nj_u1     kind;      /* NJ_LINK_*                                 */
+    nj_u1     used;
+} nj_cpentry;
+
+/* ------------------------------------------------------------------ */
+/* Class                                                               */
+/* ------------------------------------------------------------------ */
+#define NJ_CLASS_LOADED  1
+#define NJ_CLASS_LINKED  2
+#define NJ_CLASS_READY   3
+/* <clinit> threw: JVMS 5.5 keeps the class erroneous, so every later attempt
+ * throws NoClassDefFoundError instead of handing out default statics. */
+#define NJ_CLASS_ERROR   4
+
+struct nj_class {
+    const char *name;       /* internal, slash separated, e.g. java/lang/String */
+    const char *super_name; /* builtin classes: superclass name (else NULL)     */
+    nj_class   *super;
+    nj_class  **interfaces;
+    nj_u2       *iface_cp;  /* CP indices of the interfaces, resolved at link */
+    nj_u2       ninterfaces;
+
+    const nj_u1 *data;      /* raw class file bytes (kept for lazy CP resolution) */
+    nj_u4        data_len;
+    nj_u4        data_off;  /* offset of the constant pool in `data` */
+    nj_u2        cp_count;
+    const char **cp_utf8;   /* [cp_count] NUL-terminated UTF8 constants, or NULL */
+
+    nj_field   *fields;  nj_u2 field_count;   /* declared only */
+    nj_method  *methods; nj_u2 method_count;  /* declared only */
+
+    nj_u2       instance_size;  /* total bytes, including super */
+    nj_u2       id;
+    nj_u2       flags;
+    nj_u2       super_cp;    /* CP index of the superclass, 0 for Object */
+    nj_u2       this_cp;     /* CP index of this class */
+    nj_u4      *cp_info;     /* [cp_count]: (byte offset << 4) | tag */
+
+    nj_ref      class_obj;   /* java.lang.Class mirror, or NULL */
+    nj_class   *component_cls; /* array component type (arrays only) */
+
+    nj_u1       state;
+    /*
+     * Set while class_link_inner() is running on this class.  A malformed
+     * class file can name itself (or a loop of classes) as its superclass or
+     * interface; resolving it re-enters the linker before the class leaves
+     * LOADED, and without this marker that recursion is unbounded - it used
+     * to end in SIGSEGV, not an exception.  Cleared on every return.
+     */
+    nj_u1       linking;
+    nj_u1       is_array;
+    nj_u1       array_elem;  /* NJ_ARRAY_T_* for arrays, 0 otherwise */
+    nj_u1       prim;        /* primitive kind for primitive mirrors  */
+
+    struct nj_class *next_hash; /* class-table hash chain */
+};
+
+/* ------------------------------------------------------------------ */
+/* Threads and frames                                                  */
+/* ------------------------------------------------------------------ */
+#define NJ_THREAD_NEW      0
+#define NJ_THREAD_RUNNING  1
+#define NJ_THREAD_SLEEPING 2
+#define NJ_THREAD_WAITING  3
+#define NJ_THREAD_BLOCKED  4
+#define NJ_THREAD_DEAD     5
+
+/*
+ * Why a parked thread is parked.  The scheduler cannot treat every WAITING
+ * thread alike any more: Object.wait() released a monitor that the thread has
+ * to own again before it runs, while a thread blocked entering a monitor must
+ * re-execute the instruction that blocked it (its saved pc points at it).
+ */
+#define NJ_WAIT_NONE       0u  /* TimerThread/join-style park: wake = run   */
+#define NJ_WAIT_OBJECT     1u  /* Object.wait(): reacquire first, then run  */
+#define NJ_WAIT_ENTER      2u  /* blocked entering a monitor: retry         */
+
+/*
+ * Distinct monitors a thread may hold at once.  Recursion does NOT consume a
+ * slot (synchronized recursive methods are ordinary code), which is what keeps
+ * this small: game code holds one or two locks at a time, not eight.
+ */
+#define NJ_MAX_MONITORS    8
+
+typedef struct nj_frame {
+    nj_method *m;
+    nj_u4      pc;
+    nj_value  *locals;   /* == stack_mem + base */
+    nj_value  *stack;    /* operand stack base */
+    nj_value  *sp;       /* next free operand slot */
+    /*
+     * The end of THIS frame's operand stack, i.e. stack + max_stack.
+     *
+     * Without it a frame was bounded only by the thread's stack_end, so a
+     * method that pushed more than its own max_stack walked into the NEXT
+     * frame's slots - and a malformed class file can make that happen, turning
+     * class bytes into a pointer that then gets dereferenced.  The interpreter
+     * checks sp against this once per instruction.
+     */
+    nj_value  *stack_limit;
+    nj_value  *argbase;  /* where the caller's arguments start */
+    nj_u2      total_slots; /* argument slots consumed from the caller */
+    nj_ref     monitor;  /* monitor held by a synchronized method, else NULL */
+    nj_u1      is_native;
+} nj_frame;
+
+struct nj_thread {
+    nj_value  *stack_mem;   /* NJ_MAX_STACK_SLOTS slots */
+    nj_value  *stack_end;
+    nj_value  *top;         /* bump pointer for frame allocation */
+
+    nj_frame   frames[NJ_MAX_FRAMES];
+    int        nframes;
+
+    nj_ref     obj;         /* java.lang.Thread mirror OR NULL */
+    nj_ref     target;      /* Runnable for Thread(Runnable) */
+    nj_ref     entry_this;  /* receiver for the BOTTOM frame; defaults to obj */
+    nj_ref     name;
+    nj_ref     pending_exc; /* exception being propagated into this thread */
+
+    nj_s8      wake_at_ms;  /* absolute deadline when SLEEPING */
+    nj_ref     wait_monitor;/* monitor being waited on */
+    nj_s8      wait_deadline;
+    nj_u4      wakeup_seq;  /* notify() wakeup counter for wait() */
+
+    /*
+     * Held monitors, innermost last, with their recursion counts.  There is no
+     * lock word in the object header: ownership is found by scanning this
+     * thread table, which is small and lets the GC see the references through
+     * the same roots it already walks.  See the monitor section of
+     * nj_thread.c for why the runtime needs this at all.
+     */
+    nj_ref     monitors[NJ_MAX_MONITORS];
+    nj_u2      mon_depth[NJ_MAX_MONITORS];
+    nj_u2      nmonitors;
+
+    nj_u1      wait_kind;   /* one of NJ_WAIT_*                          */
+    nj_u1      wait_ready;  /* notified/timed out; waiting to reacquire  */
+    nj_u2      wait_depth;  /* recursion count released by Object.wait() */
+
+    nj_u1      state;
+    nj_u1      daemon;
+    nj_u1      started;
+    nj_u1      is_main;
+    /*
+     * Set once the thread has been seen asking for a paint it then forced
+     * twice inside one frame - the signature of a `repaint();
+     * serviceRepaints(); step();` game loop with no sleep of its own.  From
+     * then on serviceRepaints() parks the thread until the frame ends, so the
+     * loop advances one step per display frame, which is the cadence the
+     * handset gave it.  Sticky because the loop keeps that shape for life.
+     */
+    nj_u1      repaint_paced;
+    nj_s4      priority;
+    nj_s4      exit_value;
+    nj_value   ret_value;   /* result of a C-initiated call */
+    int        stop_depth;  /* nj_exec returns when nframes reaches this */
+    /*
+     * Set while this thread is parked inside a nested C call - a native that
+     * invoked Java, which parked.  Its C stack is this thread's own, and the
+     * top frame on it is the NATIVE, whose code_len is 0, so the scheduler
+     * must not run the thread: the pump in vm_invoke() resumes it instead.
+     * Running it from the scheduler executed that native frame as bytecode;
+     * five collected titles died with
+     *   VerifyError: code runs past the end of the method
+     * at nj2me/util/TimerThread.pump pc=0 that way.
+     */
+    int        in_c_call;
+
+    void      *port_ud;     /* free for the port */
+    nj_u4      id;
+};
+
+/* ------------------------------------------------------------------ */
+/* Heap                                                                */
+/* ------------------------------------------------------------------ */
+#define NJ_GC_BINS 24       /* size classes, 16 bytes apart up to 384 */
+
+typedef struct nj_gcbin {
+    void  *head;            /* free list head  */
+    nj_u4  count;
+} nj_gcbin;
+
+typedef struct nj_heap {
+    nj_u1  *base;
+    nj_size size;
+    nj_size used;           /* high-water mark of the bump pointer */
+    nj_size bump;           /* current bump offset */
+    nj_size peak;
+    nj_u4   gc_count;
+    /*
+     * Allocations attempted since the last collection.
+     *
+     * An explicit System.gc() when nothing has been allocated since the last
+     * collection has nothing new to find: the heap is in exactly the state the
+     * previous collection left it in, and that collection already reclaimed
+     * everything it could reach.  Walking the whole heap again is pure cost.
+     * One collected title called System.gc() 4000 times in a single frame.
+     *
+     * The check is deliberately conservative: a *failed* allocation counts too,
+     * so the only way this reads zero is if a collection really did just run
+     * and nothing has been asked of the heap since.
+     */
+    nj_u4   allocs_since_gc;
+    nj_gcbin bins[NJ_GC_BINS];
+    void   *big_free;       /* free list for allocations > bin range */
+    nj_u1   external;       /* base came from the port: never free it */
+} nj_heap;
+
+/* ------------------------------------------------------------------ */
+/* Class source (the JAR loader plugs in here)                         */
+/* ------------------------------------------------------------------ */
+/*
+ * The VM never touches a file system or a JAR directly.  Whatever can produce
+ * class bytes implements this one function; nj_app.c provides the JAR-backed
+ * implementation.  This keeps the core testable with in-memory fixtures and
+ * lets an ESP32 build serve classes straight out of a flash partition.
+ */
+typedef struct nj_class_source {
+    /* On success, store a freshly allocated buffer in *out_bytes (ownership
+     * passes to the VM, which copies it and frees it immediately) and its
+     * length in *out_len. */
+    nj_status (*load)(nj_vm *vm, void *ud, const char *name,
+                      nj_u1 **out_bytes, nj_u4 *out_len);
+    void *ud;
+} nj_class_source;
+
+typedef struct nj_native_binding {
+    const char  *cls;
+    const char  *name;
+    const char  *desc;
+    nj_native_fn fn;
+} nj_native_binding;
+
+typedef struct nj_codec_reg {
+    nj_codec codec;      /* a per-VM COPY, so attach() can set codec.ud */
+    int      priority;
+} nj_codec_reg;
+
+/* ------------------------------------------------------------------ */
+/* The VM                                                              */
+/* ------------------------------------------------------------------ */
+#define NJ_CLASS_HASH 64
+
+/* Slots in nj_class_find's pointer-keyed cache.  Four is enough to hold the
+ * handful of names the library asks for once per call (every String creation,
+ * every stream read); see the comment in nj_class_find for why it is safe.
+ * class_resolve_from_source hands nj_class_find the caller's own pointer, so a
+ * literal name hits this; it used to pass a normalised copy on the stack,
+ * which could only ever answer for one name. */
+#define NJ_CLASS_FIND_SLOTS 4
+
+/*
+ * Slots in the memo tables nj_field_lookup() and nj_class_lookup() keep.
+ *
+ * Those two are how every native names a class or a field, and hot ones call
+ * them millions of times: the M3G renderer walks its scene graph by name on
+ * every frame (77 distinct fields, 7,400 calls per frame in Minecraft PE) and
+ * each lookup used to cost a class-table hash, a walk of the inheritance chain
+ * and a strcmp per step.  A hit here is one hash, a pointer compare and the
+ * validations described at the lookup, so a cached answer can only be slow,
+ * never wrong.
+ *
+ * Entries live in the VM instance, not in .bss, because the runtime's own
+ * static footprint is zero (docs/FOOTPRINT.md).  A build that would rather
+ * spend the bytes elsewhere lowers the counts; the tables simply collide
+ * sooner.
+ */
+#ifndef NJ_FIELD_CACHE_SLOTS
+#  define NJ_FIELD_CACHE_SLOTS 1024
+#endif
+#ifndef NJ_CLASS_CACHE_SLOTS
+#  define NJ_CLASS_CACHE_SLOTS 128
+#endif
+
+/* Reasons a constant-pool entry failed to resolve. */
+#define NJ_RESOLVE_OK     0u
+#define NJ_RESOLVE_CLASS  1u
+#define NJ_RESOLVE_FIELD  2u
+#define NJ_RESOLVE_METHOD 3u
+#define NJ_RESOLVE_FORMAT 4u
+
+/*
+ * Hot-field slots.
+ *
+ * A handful of native paths run once per byte of bulk I/O or per text line and
+ * used to resolve their field by (class, name, descriptor) on every call -
+ * about 8 million name walks in one 900-frame 3D title.  These slots memoise
+ * the resolved nj_field pointer per VM; the lookup itself is unchanged, only
+ * its repetition is removed.  Set NJ_ENABLE_HOT_FIELDS=0 to restore the
+ * per-call lookup for targets where the 64 bytes per VM matter more.  The
+ * slot numbers exist in either mode so the natives need no #if. */
+enum {
+    NJ_HF_BAIS_BUF,     /* java/io/ByteArrayInputStream.buf   [B */
+    NJ_HF_BAIS_POS,     /* java/io/ByteArrayInputStream.pos   I  */
+    NJ_HF_BAIS_COUNT,   /* java/io/ByteArrayInputStream.count I  */
+    NJ_HF_BAIS_MARK,    /* java/io/ByteArrayInputStream.mark  I  */
+    NJ_HF_BAOS_BUF,     /* java/io/ByteArrayOutputStream.buf  [B */
+    NJ_HF_BAOS_COUNT,   /* java/io/ByteArrayOutputStream.count I */
+    NJ_HF_FONT_STYLE,   /* javax/microedition/lcdui/Font.style I */
+    NJ_HF_FONT_SIZE,    /* javax/microedition/lcdui/Font.size  I */
+    NJ_HF_DIS_IN,       /* java/io/DataInputStream.in  Ljava/io/InputStream; */
+    NJ_HF_DOS_OUT,      /* java/io/DataOutputStream.out Ljava/io/OutputStream; */
+    NJ_HF_DOS_WRITTEN,  /* java/io/DataOutputStream.written I */
+    /* nano_j2me/ResourceStream: the resource: Connector stream. */
+    NJ_HF_RS_BUF,       /* .buf   [B */
+    NJ_HF_RS_POS,       /* .pos   I  */
+    NJ_HF_RS_COUNT,     /* .count I  */
+    /* Graphics: gfx_load()/gfx_store() read and write the whole serialised
+     * state around every single drawing primitive, so these are the most
+     * often resolved fields left in a 2D paint loop. */
+    NJ_HF_G_TGT,        /* javax/microedition/lcdui/Graphics.target LImage; */
+    NJ_HF_G_TX,         /* .translateX I */
+    NJ_HF_G_TY,         /* .translateY I */
+    NJ_HF_G_CX,         /* .clipX I */
+    NJ_HF_G_CY,         /* .clipY I */
+    NJ_HF_G_CW,         /* .clipW I */
+    NJ_HF_G_CH,         /* .clipH I */
+    NJ_HF_G_COLOR,      /* .color I */
+    NJ_HF_G_BLEND,      /* .blend I */
+    NJ_HF_G_STROKE,     /* .stroke I */
+    NJ_HF_G_FONT,       /* .font LFont; */
+    NJ_HF_G_XOR,        /* .xorMode I */
+    NJ_HF_G_XORC,       /* .xorColor I */
+    NJ_HF_IMG_W,        /* javax/microedition/lcdui/Image.imgWidth  I */
+    NJ_HF_IMG_H,        /* .imgHeight I */
+    NJ_HF_IMG_PX,       /* .imgPixels [I */
+    NJ_HF_COUNT
+};
+
+#define NJ_CHEAT_MAX_CODES  32
+#define NJ_CHEAT_MAX_BYTES  16
+
+/* One arena-offset cheat patch: offset in bytes, value to write, length. */
+typedef struct nj_cheat_patch {
+    int           enabled;
+    nj_u4         offset;   /* byte offset into the arena window          */
+    unsigned char value[NJ_CHEAT_MAX_BYTES];
+    unsigned      len;      /* 1 .. NJ_CHEAT_MAX_BYTES                   */
+} nj_cheat_patch;
+
+/* The code list attached to a VM; applied at the start of every frame. */
+typedef struct nj_cheat_table {
+    int            count;
+    nj_cheat_patch patch[NJ_CHEAT_MAX_CODES];
+} nj_cheat_table;
+
+struct nj_vm {
+    nj_heap heap;
+
+    /*
+     * Cheat codes: raw byte patches over the arena window a frontend sees as
+     * SYSTEM_RAM (offset + value), re-applied at the start of every frame.
+     * The table lives in the VM so the runner, the libretro port and the
+     * Android frontend all use the same parser and the same apply point.
+     * See nj_vm_cheat_add() in include/nj2me/nj_vm.h for the code format.
+     */
+    nj_cheat_table cheats;
+
+    /* class table */
+    nj_class  *class_head[NJ_CLASS_HASH];
+    nj_class  *classes[NJ_MAX_CLASSES];
+    nj_u2      nclasses;
+    nj_u2      next_class_id;
+
+    /* nj_class_find's cache: the last name POINTER answered per slot.  A hit
+     * costs one compare and one strcmp instead of a copy, a hash and a bucket
+     * walk - and 1.5 M of the 1.9 M lookups in a 1200-frame run of 合金弹头4
+     * came through nj_field_lookup. */
+    const char *find_key[NJ_CLASS_FIND_SLOTS];
+    nj_class   *find_cls[NJ_CLASS_FIND_SLOTS];
+
+    /*
+     * nj_field_lookup()'s memo table: the (class, name, descriptor, static)
+     * POINTERS hash to a slot and the answer sits in it.  A hit is used only
+     * when the field still carries the same three names, so a caller that
+     * reuses a stack buffer gets a fresh lookup instead of a wrong field - the
+     * pointer hash decides WHICH slot to try, the names decide whether the
+     * answer is the right one.  nj_save.c clears the table when a snapshot is
+     * restored, because the class structures a restore installs are new.
+     */
+    nj_field   *fld_memo[NJ_FIELD_CACHE_SLOTS];
+    nj_u8       find_hits;
+    nj_u8       find_misses;
+
+    /* nj_class_lookup()'s memo table: same idea, one name and one class. */
+    nj_class   *cls_memo[NJ_CLASS_CACHE_SLOTS];
+
+    /*
+     * A class the engine itself creates on demand - the MIDlet timer's pump
+     * thread is the one that exists - is not in the JAR, so nj_class_resolve()
+     * has nothing to load it from by name.  The module that owns such a class
+     * installs this hook and answers for it; without it a snapshot naming that
+     * class cannot be resumed, and the load reports a JAR mismatch instead.
+     */
+    nj_class *(*class_hook)(nj_vm *vm, const char *internal_name);
+
+    /* frequently used classes (filled lazily, keeps hot paths hash-free) */
+    nj_class  *cls_string;
+    nj_class  *cls_class;
+    nj_class  *cls_object;
+    nj_class  *cls_throwable;
+    nj_class  *cls_object_array;
+
+#if NJ_ENABLE_HOT_FIELDS
+    /* See the slot enum above: lazily resolved field pointers for the hot
+     * Midp natives.  Never serialised; cleared when a save state is restored. */
+    nj_field  *hot_field[NJ_HF_COUNT];
+#endif
+
+    /* constant-pool resolution cache */
+    nj_cpentry *cp_cache;
+    nj_u2       cp_cache_size;
+
+    nj_u2       cp_cache_used;
+    nj_u2       cp_cache_limit;   /* rehash threshold */
+    nj_u4       cp_cache_hits;
+    nj_u4       cp_cache_misses;
+
+    /* statics */
+    nj_value  *statics;
+    nj_u4      nstatics;
+
+    /* threads */
+    nj_thread *threads[NJ_MAX_THREADS];
+    nj_thread *cur;
+    nj_u2      nthreads;
+    nj_u4      next_thread_id;
+    /*
+     * The MIDlet's monotonic clock: the port's 32-bit millisecond counter
+     * folded into a 64-bit epoch.  It is 64-bit on purpose - a 32-bit field
+     * truncates the carry, and the clock then jumps backwards by 49.7 days
+     * every 49.7 days.
+     */
+    nj_s8      scheduler_ticks;
+
+    /* Deterministic replay/netplay mode: the default Random() seed comes from
+     * this VM counter instead of the wall clock, so two runs that construct
+     * the same Random sequence in the same order seed identically.  Set by
+     * the libretro port when "deterministic timing" is enabled; zero for
+     * normal play, CLI and Android. */
+    int        deterministic;
+    nj_u8      deterministic_seed;
+
+    /*
+     * How fast the MIDlet's clock runs, in percent of real time.
+     *
+     * 100 is real time.  Everything a MIDlet measures goes through
+     * nj_now_ms(), so scaling that one clock scales the game: sleeps,
+     * Object.wait deadlines, java.util.Timer and the frame pacer all follow,
+     * and no code that reads the clock has to know.
+     */
+    int        speed_percent;
+    nj_s8      speed_virtual;   /* the MIDlet's instant when the scale was set */
+    nj_s8      speed_real;      /* the folded real instant it was set at */
+
+    /* pending exception */
+    nj_ref     exception;
+    nj_u4      exception_pc;
+    nj_method *exception_method;
+
+    /* Why the last constant-pool resolution failed.
+     *
+     * "it threw NoClassDefFoundError" is the least useful message a JVM can
+     * produce, and the most common real cause is not a missing class at all:
+     * it is a method or field that exists with a different descriptor.  A
+     * version of a library built against a slightly different API produces
+     * exactly that, and without the descriptor in the message it takes hours
+     * to spot.  Recording the reason here lets the interpreter raise
+     * NoSuchMethodError / NoSuchFieldError with the full signature instead. */
+    nj_u1       resolve_fail;      /* NJ_RESOLVE_* */
+    const char *resolve_cls;
+    const char *resolve_name;
+    const char *resolve_desc;
+
+    /*
+     * Why the last class *link* failed, as opposed to a constant-pool lookup.
+     * nj_class_link() already knows precisely ("superclass not found: X",
+     * "interface this runtime does not provide: Y") but it only said so
+     * through nj_logf() at debug level, which is filtered out by default.  The
+     * caller then raised a bare NoClassDefFoundError naming the class that
+     * failed and never the name it could not find - so a game that merely
+     * implements an optional-API interface looked like a corrupt class file.
+     * Both names are interned, so they outlive the failure.
+     */
+    const char *link_cls;          /* the class that failed to link */
+    const char *link_missing;      /* what it could not resolve, or NULL */
+    int         link_oom;      /* static/field area exhausted while linking */
+    nj_u1       link_cycle;        /* the failure was a class-hierarchy cycle */
+
+    /*
+     * Interned strings.  The table is a host allocation owned by the VM: it
+     * starts at NJ_MAX_INTERNED entries and doubles whenever a class-file
+     * literal arrives with the table full.  It used to be a fixed array and
+     * nj_intern() quietly returned an uninterned String once it filled up -
+     * the constant-pool caches then kept the address of a String that was no
+     * longer a GC root, the collector recycled it, and `ldc` pushed whatever
+     * object had taken its place.
+     */
+    nj_ref    *interned;           /* NULL until the first intern */
+    nj_u4      ninterned;
+    nj_u4      intern_cap;
+
+    /* MIDlet state */
+    nj_ref     app;             /* the MIDlet instance */
+    nj_class  *app_class;
+    nj_ref     display;         /* the singleton Display */
+    nj_ref     current_displayable;
+    nj_ref     thread_group;
+    /*
+     * The Graphics the frame painter hands to Canvas.paint(), reused for as
+     * long as the canvas buffer it targets stays the same object.
+     *
+     * MIDP implementations do not mint a Graphics per paint: the reference
+     * hands paint() the platform's front-buffer graphics, the same object
+     * every frame.  Ours allocated one per frame, which showed up as the
+     * single largest source of garbage in a real title - 160 bytes a frame,
+     * 3.2 MB after 20000 frames of 超级马里奥_10283, and the same linear
+     * growth in every Canvas title measured (see docs/FOOTPRINT.md).
+     * The object is rewritten to constructor defaults before each reuse, so
+     * a paint() that changes colour/clip/translate cannot leak that state
+     * into the next frame.
+     */
+    nj_ref     paint_graphics;
+    nj_ref     paint_graphics_buf;
+
+    /*
+     * Players currently feeding the audio device, as a java.util.Vector of
+     * javax.microedition.media.Player.
+     *
+     * nj_media_frame() tops these up once per emulated frame, which is how a
+     * WAV longer than the device's buffer keeps playing on a port whose
+     * pcm_write() accepts only so much at a time.  It lives on the VM for the
+     * usual reason: two VMs in one process must not be able to see each
+     * other's audio, and a file-scope list would do exactly that.
+     *
+     * NULL until something plays, so a MIDlet with no sound never pays for it.
+     */
+    nj_ref     media_players;
+
+    /*
+     * The Player that currently owns the one PCM device, or NULL.
+     *
+     * nj_port.pcm_open() configures a single device, not one per Player, so two
+     * sampled Players cannot both have it: the second open reconfigures the
+     * hardware under the first, and the second close leaves the first writing
+     * into nothing - which a player hears as "the music stopped for good".  The
+     * runtime arbitrates instead (see the device ownership block in
+     * src/midp/nj_lib_media.c) and this field says who won.  Cleared on a
+     * snapshot load, because no port device survives the trip to disk.
+     */
+    nj_ref     pcm_owner;
+
+    /*
+     * The sensor connections that have a DataListener installed.  Same reason
+     * as media_players above: the listener's dataReceived() has to be called
+     * from the frame pump, and nothing else holds those objects.  NULL until a
+     * MIDlet listens, so a program with no sensors never pays for it.
+     */
+    nj_ref     sensor_conns;
+
+    /*
+     * The Bluetooth jobs an inquiry or a service search is waiting on, held
+     * for the same reason again: javax.bluetooth's DiscoveryListener callbacks
+     * have to be called from the frame pump, and no Java object holds the job.
+     * NULL until a MIDlet starts a discovery.
+     */
+    nj_ref     bt_jobs;
+
+    /*
+     * Log throttling.  A MIDlet can call Throwable.printStackTrace() as often
+     * as it likes, and one in the corpus does it on every frame of its failure
+     * path: 24 MB and 594,000 lines in ten seconds.  On a handset that is a
+     * serial console nobody can read, or a full filesystem, or both - and in
+     * the test suite it looked exactly like a hang, because the process was
+     * busy writing rather than stuck.
+     *
+     * The first NJ_LOG_LIMIT messages go through untouched; after that they are
+     * counted and dropped, with one line saying so.  A game that logs a few
+     * thousand lines still sees all of them.
+     */
+    nj_u4      log_emitted;
+    nj_u4      log_dropped;
+    /*
+     * Wall-clock deadline on the call in progress, 0 for none.  Set around
+     * destroyApp(): a MIDlet that will not return from teardown must not be
+     * able to hold the process open.
+     */
+    nj_s8      halt_at_ms;
+    /*
+     * How long a C caller waits for a Java call that parked in a blocking
+     * native to become resumable, in milliseconds; 0 waits until the embedder
+     * stops the VM.  A title may run its whole game loop inside its MIDlet
+     * constructor (毁灭战士3 does: the constructor joins the render thread),
+     * so a port that drives frames wants to wait for it instead of failing the
+     * load after five seconds.
+     */
+    nj_u4      call_block_ms;
+    const char *stop_why;     /* who asked the VM to stop, or NULL */
+    /*
+     * Called while a Java thread is parked in a blocking native, so a runner
+     * can keep drawing.  A MIDlet may run its own frame loop inside startApp()
+     * - 仙剑奇侠传完美版 does - and on a handset the AMS paints from its own
+     * event thread, so a sleep must not stop the screen.  NULL for embedders
+     * that do not want it, which is every path that is not driving frames.
+     */
+    /*
+     * Called while a Java thread is parked in a blocking native, so that an
+     * embedder's display keeps being drawn.  Returning non-zero asks the VM to
+     * stop: the parked Java frame is abandoned and the call unwinds, which is
+     * the only way out for a MIDlet that never returns from startApp().
+     */
+    int      (*frame_hook)(nj_vm *vm, void *ud);
+    void       *frame_hook_ud;
+    int         in_frame_hook;  /* re-entrancy guard: the hook may call back in */
+    int         in_call_pump;   /* re-entrancy guard: a blocked C call is pumping */
+    /*
+     * Set only around nj_vm_save_file_boundary(): the port asks for a snapshot
+     * from the frame hook, so the hook re-entrancy guard is expected and a
+     * thread parked in a frame-wait native is normalised in the blob (see
+     * save_threads).
+     */
+    int         boundary_save;
+
+    /* seeded identity hash */
+    nj_u4      hash_seed;
+
+    /* port */
+    const nj_port *port;
+
+    /*
+     * Live frame cap: -1 means "whatever the port's fps_cap says".  nj_run
+     * copies the caller's nj_port, so this is how a port that lets the player
+     * change the cap mid-game reaches the frame loop (nj_vm_set_frame_cap).
+     */
+    int         frame_cap;
+
+    /*
+     * The system properties the DEVICE answers, on top of the runtime's own.
+     * Borrowed, not owned: a caller hands over a table of pointers into its own
+     * storage (argv, a device profile, a static array) and keeps it alive for
+     * the life of the VM.  Empty by default, which is the "generic" profile:
+     * the port's identity and nothing else.
+     */
+    const nj_device_prop *sys_props;
+    nj_u4                 nsys_props;
+    nj_u1                 motorola_softkeys; /* Canvas -21/-22, opted in by profile */
+
+    /* where class bytes come from (JAR loader, flash partition, test fixture) */
+    nj_class_source *source;
+
+    /* ---- MIDP layer state ----
+     * Owning these here rather than in file-scope variables is what lets a
+     * MIDlet be started, stopped and restarted in one process. */
+    nj_fontset    fonts;          /* mutable font registry (see nj_gfx.h)  */
+    nj_surface    screen;         /* view of the UI framebuffer            */
+    nj_u1        *screen_pixels;  /* the framebuffer itself, host-allocated */
+    nj_u4         midp_flags;     /* NJ_MIDP_* capability bits             */
+    nj_u1         repaint_pending;
+    /* Set by nj_midp_paint(), and cleared once per frame by the runner.  A
+     * title that paints synchronously - repaint() followed by
+     * serviceRepaints() - has already drawn the frame, so the runner must not
+     * paint again on top of it: the extra paint arrives after the title has
+     * cleared the state its paint() reads (仙魔飞行棋_417's
+     * mobile/k.e(I)V: f = state; repaint(); serviceRepaints(); f = 0;), and
+     * the title's own "clear the screen, then draw the current state" then
+     * leaves the screen blank.  A title that never paints synchronously keeps
+     * the runner's per-frame paint, which is the only thing that animates it
+     * (炸弹人_10311 never calls repaint() in its loop). */
+    /*
+     * Audio/video decoder providers (nj2me/nj_avcodec.h).  nj_vm_create()
+     * installs the compiled-in software decoders and a port may install its
+     * own afterwards; later installs are tried first, so hardware wins.
+     */
+    const nj_av_audio_ops *av_audio[4];
+    const nj_av_video_ops *av_video[4];
+    nj_u4         av_audio_n;
+    nj_u4         av_video_n;
+    nj_u1         painted_in_frame;
+    /*
+     * Set when a paint ran because the APPLICATION asked for it (a
+     * repaint()/serviceRepaints() pair), rather than because the runner paints
+     * a frame of its own.  A title that paints itself is left to paint itself:
+     * the runner's extra paint would show a frame the title never asked for.
+     */
+    /* Bit 0: synchronous paint; bit 1: explicit GameCanvas buffer flush. */
+    nj_u1         app_painted;
+    /* ... and that it painted THIS frame: the frame hook ages the silence. */
+    nj_u1         app_painted_frame;
+    /*
+     * The application's own painting cadence, in frames: the gap it left
+     * between its last two paints (1 while that is still unknown).  The runner
+     * fills in only when the application is OVERDUE by more than its own
+     * cadence - a title that paints every second frame never sees a runner
+     * paint in between (合金弹头2013BT版_678's flicker), while a title that
+     * painted twice at startup and then went quiet gets its frames back
+     * (开心农场BT版_6075).
+     * This fallback applies to Canvas; a self-flushing GameCanvas retains
+     * its last complete frame until another flush or explicit repaint.
+     */
+    nj_u1         app_paint_period;
+    /* Frames since the application last painted one of its own. */
+    nj_u1         app_paint_idle;
+    /* Set while a paint is being delivered.  serviceRepaints() paints
+     * synchronously, and a callSerially() runnable drained at the top of a
+     * paint may itself ask for a repaint; without this the second one would
+     * re-enter the paint path. */
+    nj_u1         in_paint;
+    /* Set while a paint is being delivered, for the whole call - including a
+     * paint that blocks (a title that loads assets from paint() and sleeps
+     * between reads).  A frame must not be pumped while this is set: the
+     * blocking-native pump (vm_invoke, see the frame hook) used to run a whole
+     * nested frame on top of the still-running paint, and a second pump pass
+     * then re-entered paint() itself.  街头霸王2冠军典藏版_1812 found this:
+     * its paint() drives a load state machine, the re-entered paint advanced
+     * the machine twice and skipped the step that loads the sample table, so
+     * the next frame read a NULL buffer and the title spun in its own empty
+     * catch block.  A handset never re-enters paint(): the AMS paints on its
+     * own thread and a paint is atomic. */
+    nj_u1         paint_active;
+    /*
+     * Who is delivering that paint, and who is parked in serviceRepaints()
+     * waiting for it to finish.  On a handset a worker thread that publishes
+     * state, calls repaint()+serviceRepaints() and only then clears/restores
+     * the published state is safe because serviceRepaints() BLOCKS until the
+     * event thread has painted.  With a non-blocking serviceRepaints() the
+     * whole publication window fits inside the worker's bytecode quantum and
+     * the frame paint, which only reads the field later, never observes it:
+     * 明星制造梦工厂_11048 spins in `while (new) {}` at the top of paint()
+     * for exactly that reason.  Parking here restores the handset ordering
+     * without making paint() reentrant.
+     */
+    nj_thread    *paint_owner;
+    nj_thread    *paint_waiters[4];
+    nj_u1         npaint_waiters;
+    /*
+     * Threads parked in serviceRepaints() until the current frame ends.
+     *
+     * A title whose own loop is `repaint(); serviceRepaints(); step();` with
+     * no sleep - 魂斗罗_5652 does exactly that from its game thread - relies on
+     * the handset blocking the call until the display has serviced the frame.
+     * With an immediately returning serviceRepaints() the loop runs millions
+     * of redundant iterations per display frame (the corpus measured 1.46M
+     * native calls and 16M bytecodes per frame, 12.9fps).  Once the request
+     * has been coalesced into the frame paint, parking here paces the loop to
+     * one iteration per frame.  The frame hook wakes every waiter when the
+     * frame ends (nj_vm_frame_done), so a waiter can never be stranded.
+     */
+    nj_thread    *pace_waiters[4];
+    nj_u1         npace_waiters;
+    /* Nesting depth of nj_midp_frame().  Non-zero means a frame pump owns the
+     * VM, so a scheduler-owned thread may safely wait for the frame boundary;
+     * zero means (startApp and friends) parking would deadlock the caller. */
+    nj_u1         in_frame;
+    /* Set while a Java callback (key, pointer, command) is being delivered.
+     * A title may call repaint() and then spin until paint() clears a field -
+     * TombRaiderMIDlet.u(I)V does exactly that - which can never finish when
+     * the frame is deferred to the next loop turn.  repaint() therefore
+     * delivers the frame itself when this is non-zero; see c_paint_now(). */
+    nj_u1         in_callback;
+    /* The finger that owns the MIDP Canvas pointer, plus one (zero means no
+     * owner yet).  Multi-touch keeps the listener fed for every finger while
+     * Canvas callbacks stay with this one, so the owner belongs to the VM
+     * instance and not to a translation-unit static. */
+    nj_u1         ptr_owner_plus1;
+    nj_u4         frames_presented;
+    /* Deadline of the next display frame, in microseconds on the MIDlet's
+     * clock.  The pacer aims at this absolute instant instead of granting
+     * itself one budget per frame, so a frame whose work overran the boundary
+     * does not push every later frame late, and the sub-millisecond part of a
+     * budget (60 fps is 16666 us, not 16 ms) is carried; see frame_pace() in
+     * nj_lib_midlet.c.  Zero means the schedule has not been started yet. */
+    nj_s8         frame_due_us;
+    nj_u2         screen_w;
+    nj_u2         screen_h;
+
+    /* image codec registry: the list of providers this VM will use.
+     * Per-VM, so a port can install a hardware decoder for one VM and not
+     * another, and so nothing survives nj_vm_destroy(). */
+    nj_codec_reg *codecs;
+    nj_u2         ncodecs;
+    nj_u2         codec_cap;
+
+    /* native method registry (per-VM hash; no GlobalState) */
+    nj_native_binding *natives;
+    nj_u2              nnatives;
+    nj_u2              native_cap;
+    nj_u4              native_hits;
+    nj_u4              native_misses;
+
+    /* builtin (C-implemented) class names, for fast "is this ours?" checks */
+    nj_class         **builtins;
+    nj_u2              nbuiltins;
+    nj_u2              builtin_cap;
+
+    /* control */
+    nj_u1      state;
+    nj_u1      running;
+    nj_u1      initialized;
+    nj_u2      verbose;      /* log level: 0=error .. 3=debug */
+    nj_s4      exit_code;
+
+    /* native call depth */
+    nj_u2      native_depth;
+
+#if NJ_ENABLE_ENGINE
+    /* Installed execution engine, or NULL for the portable interpreter.
+     * Borrowed slot; external engines retain their owner's lifetime. The
+     * optional built-in JIT is owned separately below and checks this slot at
+     * dispatch. NJ_ENABLE_ENGINE alone adds only this pointer. */
+    struct nj_engine *engine;
+#endif
+#if NJ_ENABLE_JIT
+    /* Owned built-in JIT, separate from the borrowed execution-engine slot. */
+    struct nj_jit *jit;
+#endif
+
+    /* ---- GC roots owned by C code (class library, ports) ---- */
+    nj_ref    *roots;          /* temporary root stack (JNI-local style) */
+    nj_u4      nroots;
+    nj_u4      root_cap;
+    nj_ref   **reg_roots;      /* addresses of long-lived C-side ref slots */
+    nj_u4      nreg_roots;
+    nj_u4      reg_root_cap;
+
+    /* ---- host allocation registry ----
+     * Every byte handed out by nj_host_alloc() is linked here, so
+     * nj_vm_destroy() can release all of it unconditionally.  This is what
+     * makes "exit leaves nothing behind" true even if a module forgets a
+     * free: teardown is a single sweep of this list. */
+    struct nj_hosthdr *host_head;
+    nj_u4      host_count;      /* live host allocations */
+    nj_u4      host_peak;
+    nj_u8      host_bytes;
+
+    /* GC bookkeeping / observability */
+    nj_u4      live_objects;    /* live Java objects counted at last sweep */
+    nj_u4      total_objects;
+    nj_u1      gc_requested;
+    nj_u1      in_exception_new; /* re-entrancy guard for nj_exception_new */
+    nj_u1      gc_disabled;     /* set while a native holds unrooted refs */
+#if NJ_ENABLE_DEBUG
+    nj_u1      trace;           /* NJ_TRACE: print every bytecode */
+    const char *trace_filter;   /* only methods whose name contains this */
+#endif
+
+    /*
+     * Execution counters.
+     *
+     * Per-VM, like everything else, so two VMs never share a total and nothing
+     * lives in .bss.  They are the only way to say anything quantitative about
+     * the interpreter ("N million bytecodes per second") and they make a
+     * regression visible without a profiler.
+     */
+    nj_u8      insns;           /* bytecodes dispatched */
+    nj_u8      insns_peak;      /* not used for now; reserved, keeps 16B aligned */
+    nj_u8      native_calls;
+    nj_u8      frames;          /* frames presented to the port */
+    nj_u8   paints;         /* paint() calls - see nj_midp_paint */
+    /*
+     * Triangles the Mascot Capsule rasterizer has projected and filled.  Kept
+     * apart from gfx_calls because a 2D title calls the Graphics constantly and
+     * rasterizes nothing: without this the two are indistinguishable, and "did
+     * the 3D path run" is a guess rather than an observation.
+     */
+    nj_u8   tris;
+    nj_u8   m3g_renders;      /* Graphics3D.render() calls that were reached */
+    /*
+     * Deferred Graphics3D triangles (see nj_lib_m3g.c).  A private core-side
+     * journal committed as one ordered list before anything may observe the
+     * target.  NULL when nothing is queued; owned by the M3G module.
+     */
+    void   *m3g_journal;
+    /*
+     * Auto-selected acceleration decision for ports that set
+     * `gfx_triangles_auto`: 0 unknown, 1 enabled, 2 disabled because the
+     * one-time calibration measured the software rasterizer as faster.
+     */
+    nj_u1   m3g_accel_auto;
+    nj_u8   gfx_calls;      /* Graphics method calls that loaded the
+                             * surface.  paints=N with gfx_calls=0 says the
+                             * game painted and drew nothing; gfx_calls high
+                             * with a black frame says the drawing landed
+                             * somewhere else.  Counted here and not per
+                             * pixel: a per-pixel counter would cost more
+                             * than the thing it measures. */
+
+    /* scratch: reusable buffers owned by the VM */
+    nj_u2     *scratch_u2;
+    nj_u4      scratch_u2_len;
+
+    void      *loader_ud;
+
+    /* Host reservation and caller policy. Never serialize these: a snapshot
+     * adopts the receiving VM's limit. Keep outside heap (heap_init resets it). */
+    nj_size    heap_capacity;
+    nj_size    heap_limit;
+};
+
+/* VM states */
+#define NJ_VM_READY     0
+#define NJ_VM_RUNNING   1
+#define NJ_VM_STOPPING  2
+#define NJ_VM_DEAD      3
+
+/* ------------------------------------------------------------------ */
+/* Heap / GC (nj_heap.c)                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The arena block header, exposed so the interpreter can inline the
+ * live-object check below.
+ *
+ * An allocation is preceded by a 16-byte header whose second word is a magic
+ * number; the sweep clears that word when it frees a block, and the free list
+ * then writes its next pointer over the payload's first word.  So a dangling
+ * reference looks like an object whose `cls` is a heap address (or NULL), and
+ * reading the magic is what tells the two apart.
+ */
+#define NJ_BLOCK_MAGIC   0x4E4A424Bu   /* 'NJBK' */
+#define NJ_BLOCK_HDR     16u           /* sizeof(nj_block), 16-byte aligned */
+
+typedef struct nj_block {
+    nj_u4 size;    /* total bytes of this block, header included */
+    nj_u4 magic;
+} nj_block;
+
+/* Is this pointer inside the Java arena at all?  Nearly free, and sound:
+ * every object lives in [base, base+bump), so anything outside is provably
+ * not one.  See the long note on nj_heap_owns() in nj_heap.c. */
+static inline int nj_in_arena(nj_vm *vm, const void *p)
+{
+    const nj_u1 *q = (const nj_u1 *)p;
+
+    if (!q || !vm->heap.base) {
+        return 0;
+    }
+    if (q < vm->heap.base || q >= vm->heap.base + vm->heap.bump) {
+        return 0;
+    }
+    /* Objects are NJ_OBJ_ALIGN-aligned; a stray int is unlikely to be, and the
+     * alignment test rejects most garbage before it reaches ->kind. */
+    if (((nj_size)(uintptr_t)q & (NJ_OBJ_ALIGN - 1u)) != 0u) {
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Is this pointer a LIVE object, or merely an address inside the arena?
+ *
+ * Inlined because the interpreter asks it on every reference-typed operand it
+ * is about to dereference, and on the fixtures that is millions of times per
+ * run; the magic load is a word the allocator touched a moment ago, so it is
+ * in cache.  nj_heap_owns_object() in nj_heap.c is the same check as an
+ * out-of-line function, for callers that prefer a symbol.
+ */
+static inline int nj_heap_owns_object_fast(nj_vm *vm, const void *p)
+{
+    const nj_u1 *q = (const nj_u1 *)p;
+    const nj_block *b;
+    const nj_object *o;
+
+    if (!nj_in_arena(vm, p)) {
+        return 0;
+    }
+    if (q < vm->heap.base + NJ_BLOCK_HDR) {
+        return 0;               /* the arena's own header, not a payload */
+    }
+    b = (const nj_block *)(const void *)(q - NJ_BLOCK_HDR);
+    if (b->magic != NJ_BLOCK_MAGIC) {
+        return 0;               /* freed, or an interior pointer */
+    }
+    o = (const nj_object *)p;
+    if (o->kind > NJ_OBJ_THROW || o->size < sizeof(nj_object)) {
+        return 0;               /* a payload, but not a live object header */
+    }
+    return 1;
+}
+
+/*
+ * Run <clinit> only when it has not run yet.
+ *
+ * A class reaches NJ_CLASS_READY after its own initialisation and stays there,
+ * so this is one load and a predictable branch on the overwhelming majority of
+ * calls - where a plain nj_class_init() would be a function call per `new`,
+ * per static field access and per static invoke.
+ */
+nj_status nj_class_init(nj_vm *vm, nj_class *c);
+
+static inline nj_status nj_class_init_lazy(nj_vm *vm, nj_class *c)
+{
+    if (c && c->state == NJ_CLASS_READY) {
+        return NJ_OK;
+    }
+    return nj_class_init(vm, c);
+}
+
+/*
+ * Pop the current frame.
+ *
+ * A decrement and a store, done on every return from a Java method and every
+ * native call; nj_frame_pop() in nj_thread.c keeps the same body for callers
+ * that prefer a symbol (and for the "no statics" build, which counts the
+ * function's own object file).
+ */
+void nj_frame_pop(nj_vm *vm, nj_thread *th);
+
+#if NJ_ENABLE_HOT_FIELDS
+/* Resolve a hot field once per VM.  The returned pointer is identical to what
+ * nj_field_lookup() would return; a failed lookup is retried on the next call
+ * rather than cached, so a class that was not loadable yet still works. */
+static inline nj_field *nj_hot_field(nj_vm *vm, int slot, const char *cls,
+                                     const char *name, const char *desc)
+{
+    nj_field *f = vm->hot_field[slot];
+    if (!f) {
+        f = nj_field_lookup(vm, cls, name, desc, 0);
+        vm->hot_field[slot] = f;
+    }
+    return f;
+}
+#else
+#define nj_hot_field(vm, slot, cls, name, desc) \
+    nj_field_lookup((vm), (cls), (name), (desc), 0)
+#endif
+
+static inline void nj_frame_pop_fast(nj_thread *th)
+{
+    if (th->nframes > 0) {
+        th->nframes--;
+        th->top = th->frames[th->nframes].locals;
+    }
+}
+
+nj_status nj_heap_init(nj_vm *vm, void *block, nj_size size);
+void *nj_heap_reserve(nj_vm *vm, nj_size size, nj_size *capacity);
+void      nj_heap_destroy(nj_vm *vm);
+void     *nj_alloc(nj_vm *vm, nj_size bytes);         /* raw, zeroed */
+nj_ref    nj_new_instance(nj_vm *vm, nj_class *cls);
+nj_ref    nj_new_array(nj_vm *vm, nj_class *array_cls, nj_u4 length, int elem_kind);
+nj_status nj_gc_run(nj_vm *vm);
+void      nj_gc_mark_ref(nj_vm *vm, nj_ref r);
+int       nj_heap_owns(nj_vm *vm, const void *p);   /* range check for untyped slots */
+int       nj_heap_owns_object(nj_vm *vm, const void *p);  /* + live-block magic */
+void      nj_gc_mark_value(nj_vm *vm, nj_value v);
+nj_size   nj_heap_free_bytes(nj_vm *vm);
+nj_size   nj_heap_used_bytes(nj_vm *vm);
+void     *nj_host_alloc(nj_vm *vm, nj_size n);        /* tracked, zeroed */
+void      nj_host_free(nj_vm *vm, void *p);
+nj_u4     nj_host_live_count(nj_vm *vm);
+
+/* Temporary GC roots.  Any C code that holds an nj_ref across a call which
+ * might allocate (or reach a GC safe point) must root it:
+ *
+ *     nj_u4 mark = nj_root_mark(vm);
+ *     nj_ref a = nj_root(vm, nj_object_new(vm, "java/lang/Object"));
+ *     ...
+ *     nj_root_release(vm, mark);
+ */
+nj_u4  nj_root_mark(nj_vm *vm);
+nj_ref nj_root(nj_vm *vm, nj_ref r);
+void   nj_root_release(nj_vm *vm, nj_u4 mark);
+/* Register the address of a long-lived C-side nj_ref slot. */
+nj_status nj_gc_register_root(nj_vm *vm, nj_ref *slot);
+void      nj_gc_unregister_root(nj_vm *vm, nj_ref *slot);
+
+/* ------------------------------------------------------------------ */
+/* Class loading / linking (nj_class.c)                                */
+/* ------------------------------------------------------------------ */
+nj_class *nj_class_load(nj_vm *vm, const char *internal_name, const nj_u1 *bytes, nj_u4 len);
+nj_class *nj_class_find(nj_vm *vm, const char *internal_name);
+nj_class *nj_class_resolve(nj_vm *vm, const char *internal_name); /* load if needed */
+/*
+ * The java.lang.Class mirror for a named class, created on first use.  A
+ * class literal (ldc of CONSTANT_Class), Object.getClass() and
+ * Class.forName() must all return the same object, because titles compare
+ * them with ==.
+ */
+nj_ref      nj_class_object(nj_vm *vm, const char *name);
+nj_class *nj_class_find_or_create_array(nj_vm *vm, nj_class *elem, int dims);
+nj_status nj_class_link(nj_vm *vm, nj_class *c);
+nj_status nj_cp_cache_init(nj_vm *vm, nj_u2 size);
+nj_status nj_class_ensure_refs(nj_vm *vm, nj_class *c);
+
+/* accessors used by the interpreter */
+const char *nj_cp_utf8(nj_class *c, nj_u2 index);
+nj_status   nj_cp_resolve(nj_vm *vm, nj_class *c, nj_u2 index, nj_cpentry **out);
+/* Raise the Java error matching the recorded resolution failure, with the
+ * full signature in the message.  Call after nj_cp_resolve returns non-NJ_OK. */
+nj_status   nj_resolve_error(nj_vm *vm);
+
+/*
+ * The same (class, index) pair is asked for tens of millions of times in a run
+ * and essentially every one of those is a hit: 实况足球经理2009_10609 asked 34.5
+ * million times and missed 1,076.  The lookup was a call into nj_class.c that
+ * read the entry's tag and offset before it even consulted the cache, so the
+ * interpreter probes the cache itself and calls the resolver only on a miss.
+ *
+ * The hash is nj_class.c's cp_key_hash(), which now calls this one: one
+ * function, one table.
+ */
+static inline nj_u4 nj_cp_key_hash(const nj_class *c, nj_u4 cp_index)
+{
+    nj_u4 h = (nj_u4)(((nj_size)(uintptr_t)c) >> 4);
+    h ^= cp_index * 2654435761u;
+    h ^= h >> 15;
+    return h;
+}
+
+static inline nj_cpentry *nj_cp_hit(nj_vm *vm, nj_class *c, nj_u2 index)
+{
+    nj_u4 mask, h, probes = 0u;
+
+    if (vm->cp_cache_size == 0u) {
+        return NULL;
+    }
+    mask = (nj_u4)vm->cp_cache_size - 1u;
+    h = nj_cp_key_hash(c, (nj_u4)index) & mask;
+    /* Match cp_cache_slot's probe order: a cached collision should not call
+     * the resolver just to hash and scan the same prefix again. */
+    while (probes++ <= mask) {
+        nj_cpentry *e = &vm->cp_cache[h];
+        if (!e->used) {
+            return NULL;
+        }
+        if (e->cls == c && e->cp_index == index) {
+            vm->cp_cache_hits++;
+            return e;
+        }
+        h = (h + 1u) & mask;
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Field access, inlined for the interpreter                          */
+/* ------------------------------------------------------------------ */
+/*
+ * A field is read or written tens of millions of times in a run and every one
+ * of those was a call plus the same two-branch address computation:
+ * 实况足球经理2009_10609 made 1.78 million nj_field_read_ref() calls and 1.76
+ * million nj_field_read_long() calls in 400 frames.
+ *
+ * The bodies below are the single implementation of each type switch - the
+ * out-of-line accessors in nj_vm.c call them too, after their own address
+ * check - so an inlined read and a called one cannot drift apart.
+ */
+static inline nj_u1 *nj_field_addr_fast(nj_vm *vm, nj_ref obj,
+                                        const nj_field *f)
+{
+    if ((f->flags & NJ_ACC_STATIC) != 0u) {
+        if (vm == NULL || (nj_u4)f->offset >= vm->nstatics) {
+            return NULL;
+        }
+        return (nj_u1 *)&vm->statics[f->offset];
+    }
+    if (obj == NULL) {
+        return NULL;
+    }
+    return (nj_u1 *)obj + f->offset;
+}
+
+static inline nj_s4 nj_field_load_int(const nj_u1 *p, const nj_field *f)
+{
+    switch (f->ptype) {
+    case NJ_PT_BOOLEAN:
+    case NJ_PT_BYTE:   return (nj_s4)(*(const nj_s1 *)p);
+    case NJ_PT_CHAR:   return (nj_s4)(*(const nj_u2 *)p);
+    case NJ_PT_SHORT:  return (nj_s4)(*(const nj_s2 *)p);
+    case NJ_PT_LONG:   return (nj_s4)(*(const nj_s8 *)p);
+    case NJ_PT_FLOAT:  return (nj_s4)(*(const float *)p);
+    case NJ_PT_DOUBLE: return (nj_s4)(*(const double *)p);
+    case NJ_PT_OBJECT: {
+        nj_ref r;
+        memcpy(&r, p, sizeof(r));
+        return (nj_s4)(nj_size)(uintptr_t)r;
+    }
+    default:           return *(const nj_s4 *)p;
+    }
+}
+
+static inline void nj_field_store_int(nj_u1 *p, const nj_field *f, nj_s4 v)
+{
+    switch (f->ptype) {
+    case NJ_PT_BOOLEAN:
+    case NJ_PT_BYTE:   *(nj_s1 *)p = (nj_s1)v; break;
+    case NJ_PT_CHAR:   *(nj_u2 *)p = (nj_u2)v; break;
+    case NJ_PT_SHORT:  *(nj_s2 *)p = (nj_s2)v; break;
+    case NJ_PT_LONG:   *(nj_s8 *)p = (nj_s8)v; break;
+    case NJ_PT_FLOAT:  *(float *)p = (float)v; break;
+    case NJ_PT_DOUBLE: *(double *)p = (double)v; break;
+    case NJ_PT_OBJECT: {
+        nj_ref r = (nj_ref)(void *)(uintptr_t)(nj_size)v;
+        memcpy(p, &r, sizeof(r));
+        break;
+    }
+    default:           *(nj_s4 *)p = v; break;
+    }
+}
+
+static inline nj_s8 nj_field_load_long(const nj_u1 *p, const nj_field *f)
+{
+    if (f->ptype == NJ_PT_DOUBLE) {
+        return (nj_s8)(*(const double *)p);
+    }
+    return *(const nj_s8 *)p;
+}
+
+static inline void nj_field_store_long(nj_u1 *p, const nj_field *f, nj_s8 v)
+{
+    if (f->ptype == NJ_PT_DOUBLE) {
+        *(double *)p = (double)v;
+    } else {
+        *(nj_s8 *)p = v;
+    }
+}
+
+static inline nj_s4 nj_field_read_int_fast(nj_vm *vm, nj_ref obj,
+                                           const nj_field *f)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    return p ? nj_field_load_int(p, f) : 0;
+}
+
+static inline void nj_field_write_int_fast(nj_vm *vm, nj_ref obj,
+                                           const nj_field *f, nj_s4 v)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    if (p) {
+        nj_field_store_int(p, f, v);
+    }
+}
+
+static inline nj_s8 nj_field_read_long_fast(nj_vm *vm, nj_ref obj,
+                                            const nj_field *f)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    if (!p) {
+        return 0;
+    }
+    if (f->ptype == NJ_PT_LONG || f->ptype == NJ_PT_DOUBLE) {
+        return nj_field_load_long(p, f);
+    }
+    return (nj_s8)nj_field_load_int(p, f);
+}
+
+static inline void nj_field_write_long_fast(nj_vm *vm, nj_ref obj,
+                                            const nj_field *f, nj_s8 v)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    if (!p) {
+        return;
+    }
+    if (f->ptype == NJ_PT_LONG || f->ptype == NJ_PT_DOUBLE) {
+        nj_field_store_long(p, f, v);
+    } else {
+        nj_field_store_int(p, f, (nj_s4)v);
+    }
+}
+
+static inline nj_ref nj_field_read_ref_fast(nj_vm *vm, nj_ref obj,
+                                            const nj_field *f)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    nj_ref r = NULL;
+    if (p) {
+        memcpy(&r, p, sizeof(r));
+    }
+    return r;
+}
+
+static inline void nj_field_write_ref_fast(nj_vm *vm, nj_ref obj,
+                                           const nj_field *f, nj_ref v)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    if (p) {
+        memcpy(p, &v, sizeof(v));
+    }
+}
+
+static inline nj_u4 nj_field_read_bits32_fast(nj_vm *vm, nj_ref obj,
+                                              const nj_field *f)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    nj_u4 v = 0u;
+    if (p) {
+        memcpy(&v, p, 4u);
+    }
+    return v;
+}
+
+static inline void nj_field_write_bits32_fast(nj_vm *vm, nj_ref obj,
+                                              const nj_field *f, nj_u4 v)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    if (p) {
+        memcpy(p, &v, 4u);
+    }
+}
+
+static inline nj_u8 nj_field_read_bits64_fast(nj_vm *vm, nj_ref obj,
+                                              const nj_field *f)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    nj_u8 v = 0u;
+    if (p) {
+        memcpy(&v, p, 8u);
+    }
+    return v;
+}
+
+static inline void nj_field_write_bits64_fast(nj_vm *vm, nj_ref obj,
+                                              const nj_field *f, nj_u8 v)
+{
+    nj_u1 *p = nj_field_addr_fast(vm, obj, f);
+    if (p) {
+        memcpy(p, &v, 8u);
+    }
+}
+nj_method  *nj_method_lookup(nj_class *c, const char *name, const char *desc);
+const char *nj_cp_class_name(nj_class *c, nj_u2 class_index);
+nj_ref      nj_array_new_of(nj_vm *vm, const char *array_desc, nj_u4 len);
+nj_field   *nj_field_lookup_in(nj_class *c, const char *name, const char *desc, int is_static);
+int         nj_class_is_subclass_of(nj_class *c, nj_class *maybe_super);
+int         nj_class_is_assignable(nj_class *from, nj_class *to);
+const char *nj_intern_cstr(nj_vm *vm, const char *s);
+/* Parse a field descriptor: returns the nj_ptype and writes the slot width. */
+nj_u1       nj_desc_ptype(const char *desc, nj_u1 *width);
+/* Number of argument slots a method descriptor consumes (excluding `this`). */
+nj_u2       nj_desc_arg_slots(const char *desc);
+nj_u1       nj_desc_ret_ptype(const char *desc);
+/* 0 = primitive in out[0] (out[1] zeroed), 1 = object ref in *out_ref, -1 = bad */
+int         nj_cp_const(nj_vm *vm, nj_class *c, nj_u2 index, int allow_string,
+                        nj_value *out, nj_ref *out_ref);
+nj_status   nj_class_init(nj_vm *vm, nj_class *c);
+
+/* String representation flag (nj_object.aflags for NJ_OBJ_STRING). */
+#define NJ_STR_WRAPPED 0x0001u
+
+/* ------------------------------------------------------------------ */
+/* Strings (nj_string.c)                                               */
+/* ------------------------------------------------------------------ */
+nj_ref      nj_new_string_utf8(nj_vm *vm, const char *s, int len);
+nj_ref      nj_new_string_utf16(nj_vm *vm, const nj_u2 *s, int len);
+nj_ref      nj_new_string_ascii(nj_vm *vm, const char *s);
+nj_u2      *nj_string_chars(nj_ref s);      /* UTF-16 payload */
+nj_u4       nj_string_len(nj_ref s);
+int         nj_utf8_to_utf16(const char *src, int src_len, nj_u2 *dst, int dst_cap);
+int         nj_utf16_to_utf8(const nj_u2 *src, int src_len, char *dst, int dst_cap);
+nj_ref      nj_intern(nj_vm *vm, nj_ref s);
+/* Make room for at least `count` interned strings; 0 when host memory runs out.
+ * Used by the state loader before it fills the table from a snapshot. */
+int         nj_intern_reserve(nj_vm *vm, nj_u4 count);
+int         nj_string_equals_cstr(nj_ref s, const char *cstr);
+int         nj_string_hash(nj_ref s);
+nj_ref      nj_string_concat(nj_vm *vm, nj_ref a, nj_ref b);
+nj_status   nj_string_set_chars(nj_vm *vm, nj_ref s, const nj_u2 *chars, nj_u4 len);
+nj_s4       nj_identity_hash(nj_vm *vm, nj_ref o);
+/* Java's decimal form for a float or a double ("1.0", "NaN", "Infinity").
+   Shared by Float/Double.toString and String.valueOf(double). */
+void        nj_fmt_double(char *buf, size_t cap, double v);
+
+/* ------------------------------------------------------------------ */
+/* Threads (nj_thread.c)                                               */
+/* ------------------------------------------------------------------ */
+nj_thread *nj_thread_create(nj_vm *vm, nj_ref thread_obj, int is_main);
+nj_thread *nj_thread_main(nj_vm *vm);
+void       nj_thread_destroy(nj_vm *vm, nj_thread *t);
+nj_status  nj_thread_start(nj_vm *vm, nj_thread *t, nj_method *run);
+nj_status  nj_frame_push(nj_vm *vm, nj_thread *th, nj_method *m,
+                         nj_value *argbase, nj_u2 total_slots);
+void       nj_frame_pop(nj_vm *vm, nj_thread *th);
+nj_status  nj_scheduler_run(nj_vm *vm);
+nj_status  nj_scheduler_step(nj_vm *vm);
+nj_status  nj_scheduler_frame(nj_vm *vm, nj_u4 budget_ms);
+int         nj_scheduler_has_threads(nj_vm *vm);
+nj_status  nj_scheduler_run_until_idle(nj_vm *vm, nj_u4 budget_ms);
+/* Seed the virtual epoch once after setup; restores supply their own anchor. */
+/* Re-apply every enabled cheat patch over the VM's arena (nj_cheat.c). */
+void       nj_cheat_apply(nj_vm *vm);
+void       nj_clock_init(nj_vm *vm);
+nj_s8      nj_now_ms(nj_vm *vm);
+void       nj_vm_stop(nj_vm *vm, nj_s4 exit_code);
+/* ------------------------------------------------------------------ */
+/* Detected canvases (nj_detect.c)                                     */
+/* ------------------------------------------------------------------ */
+/*
+ * Turn the box a port detected a MIDlet painting into the screen size that box
+ * most likely is, or refuse when it is not a screen anybody makes.  See
+ * src/core/nj_detect.c for why a port wants this at all: a port that crops to
+ * the raw box zooms a game into a strip of itself when the game only ever
+ * touched part of its canvas.  Returns 1 and writes the box to use, centred on
+ * the detected one, or 0 when the caller should keep watching.
+ */
+int        nj_detect_snap(int bx, int by, int bw, int bh, int cw, int ch,
+                          int *ox, int *oy, int *ow, int *oh);
+void       nj_vm_stop_reason(nj_vm *vm, nj_s4 exit_code, const char *why);
+nj_status  nj_vm_monitor_wait(nj_vm *vm, nj_thread *t, nj_ref obj, nj_s8 timeout_ms);
+int        nj_vm_monitor_notify(nj_vm *vm, nj_ref obj, int all);
+nj_status  nj_thread_sleep(nj_vm *vm, nj_thread *t, nj_s8 ms);
+/* Park a thread until the paint in flight on another thread has finished. */
+int        nj_vm_thread_wait_paint(nj_vm *vm, nj_thread *t);
+/* Wake every thread parked in serviceRepaints() for the finished paint. */
+void       nj_vm_paint_done(nj_vm *vm);
+/*
+ * Park a scheduler-owned thread in serviceRepaints() until the current frame
+ * ends, and wake those threads at the frame boundary.  This is the pacing
+ * contract a title's own paint loop relies on; see the fields in nj_vm.
+ */
+int        nj_vm_thread_wait_frame(nj_vm *vm, nj_thread *t);
+void       nj_vm_frame_done(nj_vm *vm);
+/*
+ * Monitor operations.  Enter/exit take the thread explicitly: the interpreter
+ * releases a synchronized method's monitor from inside a returning frame, and
+ * the unwind path does the same for frames it drops, neither of which is "the
+ * VM's current thread" by construction.
+ *
+ * nj_vm_monitor_enter() -> 0 acquired, 1 blocked (thread state is BLOCKED and
+ * the caller must re-execute its instruction), 2 no room in the thread's
+ * monitor list (the caller should throw IllegalStateException).
+ * nj_vm_monitor_exit()  -> 0 released, -1 the thread does not own it (or it is
+ * not the innermost monitor, which only unbalanced bytecode can ask for).
+ */
+int        nj_vm_monitor_enter(nj_vm *vm, nj_thread *t, nj_ref obj);
+int        nj_vm_monitor_exit(nj_vm *vm, nj_thread *t, nj_ref obj);
+int        nj_vm_monitor_owned(const nj_vm *vm, const nj_thread *t,
+                               nj_ref obj);
+/* A waiter asked for its monitor back (timeout expired or notifier ran).
+ * 1 when it owns the monitor again and is runnable, 0 when somebody else
+ * holds it - the caller then keeps the thread parked, because wait() returns
+ * WITH the monitor held. */
+int        nj_vm_monitor_reacquire(nj_vm *vm, nj_thread *t);
+
+/* ------------------------------------------------------------------ */
+/* Native function signature helpers                                   */
+/* ------------------------------------------------------------------ */
+/*
+ * Every native has the same four-parameter signature, so most of them do not
+ * touch all four arguments.  Tagging the parameters here keeps
+ * -Wall -Wextra -Werror clean without sprinkling (void) casts through the
+ * whole class library.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#  define NJ_MAYBE_UNUSED __attribute__((unused))
+#else
+#  define NJ_MAYBE_UNUSED
+#endif
+
+#define NJ_NATIVE_FN(name)                                            \
+    static nj_status name(nj_vm *vm NJ_MAYBE_UNUSED,                  \
+                          nj_thread *th NJ_MAYBE_UNUSED,              \
+                          nj_value *args NJ_MAYBE_UNUSED,             \
+                          nj_value *ret NJ_MAYBE_UNUSED)
+
+/* ------------------------------------------------------------------ */
+/* Natives (nj_native.c)                                               */
+/* ------------------------------------------------------------------ */
+nj_status    nj_natives_init(nj_vm *vm);
+void         nj_natives_shutdown(nj_vm *vm);
+/*
+ * Every class-library module, in one table.  Exposed to tests so that a check
+ * can walk *all* of them instead of a hand-written list that a new module
+ * would silently fall off.  `const`, so .rodata - no RAM, no mutable global.
+ */
+typedef struct nj_builtin_source {
+    const nj_builtin_class *classes;
+    const int              *count;
+} nj_builtin_source;
+
+extern const nj_builtin_source nj_builtin_sources[];
+extern const int               nj_builtin_source_count;
+
+nj_native_fn nj_native_find(nj_vm *vm, const char *cls, const char *name,
+                            const char *desc);
+/* Every class-library module exposes its bindings through these; nj_native.c
+ * aggregates them, and the VM holds the resulting hash so there is no global
+ * registry. */
+void nj_natives_collect(nj_vm *vm);
+
+/* Implemented in nj_builtins.c: materialises every C-implemented class. */
+/*
+ * Register every builtin class.  Returns NJ_OK, or NJ_ERR_NOMEM if the host
+ * allocator ran out - which the caller MUST treat as fatal for the VM.  A
+ * half-registered class table does not fail where it broke: it fails later, in
+ * whatever first looks up a builtin that is missing, usually as a wild pointer.
+ */
+nj_status nj_builtins_register_all(nj_vm *vm);
+/* Create one builtin class from its descriptor (nj_class.c). */
+nj_class *nj_class_create_builtin(nj_vm *vm, const nj_builtin_class *bc);
+/*
+ * Wrapper TYPE statics (java.lang.Integer.TYPE and friends) point at the
+ * primitive Class mirrors.  They can only be filled after every builtin class
+ * is linked, so nj_builtins_register_all() calls this (nj_lib_boxing.c).
+ */
+nj_status   nj_boxing_init(nj_vm *vm);
+/* Class mirror for a primitive descriptor character ('I','J','S','B','C',
+ * 'Z','F','D'). */
+nj_ref      nj_primitive_class_object(nj_vm *vm, char desc);
+/* Class mirror for any field descriptor ("I", "[I", "Ljava/lang/String;").
+ * Used by java.lang.reflect.Method for parameter and return types. */
+nj_ref      nj_class_object_for_desc(nj_vm *vm, const char *desc);
+
+/* ------------------------------------------------------------------ */
+/* Interpreter (nj_vm.c)                                               */
+/* ------------------------------------------------------------------ */
+/* Run one thread until it blocks, dies or the quantum expires.
+ * The pending exception, if any, lives in vm->exception. */
+nj_status nj_exec(nj_vm *vm, nj_thread *th, int stop_depth);
+/* The portable interpreter loop.  nj_exec() forwards here when no pluggable
+ * execution engine is installed (or always, when NJ_ENABLE_ENGINE is 0). */
+nj_status nj_interp_run(nj_vm *vm, nj_thread *th, int stop_depth);
+nj_status nj_invoke_native(nj_vm *vm, nj_thread *th, nj_method *target,
+                           nj_value *argbase, nj_u2 total, nj_value *ret);
+nj_status nj_vm_throw(nj_vm *vm, const char *class_name, const char *msg);
+nj_status nj_vm_throw_ref(nj_vm *vm, nj_ref exc);
+nj_status nj_vm_throw_new(nj_vm *vm, const char *class_name);
+nj_ref    nj_vm_exception_new(nj_vm *vm, const char *class_name, const char *msg);
+nj_status nj_vm_call(nj_vm *vm, nj_ref obj, const char *cls,
+                     const char *name, const char *desc,
+                     nj_value *args, int nargs, nj_value *ret);
+nj_status nj_vm_call_static(nj_vm *vm, const char *cls,
+                            const char *name, const char *desc,
+                            nj_value *args, int nargs, nj_value *ret);
+void      nj_fatal(nj_vm *vm, const char *fmt, ...);
+#if NJ_ENABLE_DEBUG
+void      nj_trace_step(nj_vm *vm, nj_method *m, nj_u4 pc, nj_u4 depth,
+                        nj_value *locals, nj_value *stack, nj_value *sp);
+int       nj_trace_enabled(nj_vm *vm);
+#endif
+void      nj_logf(nj_vm *vm, int level, const char *fmt, ...);
+
+/* Forget nonportable Player handles in a restored object, without closing them.
+ * The loader calls this after reference fixups and before enabling GC. */
+void      nj_media_restore_object(nj_vm *vm, nj_ref object);
+
+/*
+ * NOTE: there is intentionally no nj_vm_current()/nj_vm_set_current().
+ * The runtime keeps zero mutable global state, so several nj_vm instances can
+ * coexist and every entry point takes the VM explicitly.  Natives receive it
+ * as their first parameter; the interpreter and the class library thread it
+ * through.  Do not reintroduce a hidden "current VM" singleton.
+ */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NJ_INTERNAL_H */
